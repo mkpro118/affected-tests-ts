@@ -146,3 +146,9 @@ impl TryFrom<&str> for ImportSpecifier {
         })
     }
 }
+
+impl std::fmt::Display for ImportSpecifier {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}

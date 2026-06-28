@@ -48,6 +48,20 @@ pub enum AppError {
         /// Human-readable graph failure.
         message: Box<str>,
     },
+    /// A non-literal dynamic import requires the full suite.
+    #[error("unknown dynamic import in {importer}")]
+    UnknownDynamicImport {
+        /// File containing the unresolved dynamic import.
+        importer: crate::roots::RootRelativePath,
+    },
+    /// A local import could not be resolved safely.
+    #[error("unresolved local import `{specifier}` in {importer}")]
+    UnresolvedLocalImport {
+        /// File containing the unresolved import.
+        importer: crate::roots::RootRelativePath,
+        /// Import specifier text that could not be resolved.
+        specifier: crate::roots::ImportSpecifier,
+    },
     /// Rendering failed after selection completed.
     #[error("output error: {message}")]
     Output {

@@ -86,9 +86,8 @@ where
 
         if should_fail_for_dynamic_imports(&self.config, imports.unsupported_dynamic_imports.len())
         {
-            return Err(failure::AppError::Graph {
-                message: format!("full run required: unsupported dynamic import in {path}")
-                    .into_boxed_str(),
+            return Err(failure::AppError::UnknownDynamicImport {
+                importer: path.clone(),
             });
         }
 
@@ -207,13 +206,9 @@ where
             modules::Outcome::Resolved(path) => dependencies.push(path),
             modules::Outcome::External(_specifier) => {}
             modules::Outcome::Unresolved(specifier) => {
-                return Err(failure::AppError::Graph {
-                    message: format!(
-                        "full run required: unresolved local import `{}` in {}",
-                        specifier.as_str(),
-                        importer,
-                    )
-                    .into_boxed_str(),
+                return Err(failure::AppError::UnresolvedLocalImport {
+                    importer,
+                    specifier,
                 });
             }
         }
@@ -424,7 +419,10 @@ mod tests {
         let error =
             super::ImportResolver::dependencies_for(&imports, &path("src/router.ts")).unwrap_err();
 
-        assert!(error.to_string().contains("full run required"));
+        assert!(matches!(
+            error,
+            failure::AppError::UnknownDynamicImport { importer } if importer == path("src/router.ts")
+        ));
     }
 
     #[test]
@@ -447,6 +445,10 @@ mod tests {
         let error = super::ImportResolver::dependencies_for(&imports, &path("src/pages/home.ts"))
             .unwrap_err();
 
-        assert!(error.to_string().contains("unresolved local import"));
+        assert!(matches!(
+            error,
+            failure::AppError::UnresolvedLocalImport { importer, specifier }
+                if importer == path("src/pages/home.ts") && specifier.as_str() == "./missing"
+        ));
     }
 }
