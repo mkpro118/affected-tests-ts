@@ -24,6 +24,12 @@ pub enum AppError {
         /// Human-readable configuration failure.
         message: Box<str>,
     },
+    /// Source parsing failed before imports could be extracted.
+    #[error("parse error: {message}")]
+    Parse {
+        /// Human-readable parser failure.
+        message: Box<str>,
+    },
     /// A filesystem adapter failed.
     #[error("filesystem error: {message}")]
     FileSystem {

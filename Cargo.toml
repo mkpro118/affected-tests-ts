@@ -14,6 +14,11 @@ clap = { version = "4.6.1", features = ["derive"] }
 crossterm = "0.29.0"
 globset = "0.4.18"
 ignore = "0.4.26"
+oxc_allocator = "0.137.0"
+oxc_ast = "0.137.0"
+oxc_ast_visit = "0.137.0"
+oxc_parser = "0.137.0"
+oxc_span = "0.137.0"
 ratatui = "0.30.2"
 rayon = "1.12.0"
 serde = { version = "1.0.228", features = ["derive"] }

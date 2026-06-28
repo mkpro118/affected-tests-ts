@@ -1,9 +1,12 @@
 //! Configuration contracts for discovery, resolution, and invalidation rules.
 
 use serde::Deserialize;
+use std::collections::BTreeMap;
 
 use crate::failure;
 use crate::roots;
+
+type RawPathMappings = BTreeMap<Box<str>, Box<[Box<str>]>>;
 
 /// Behavior used when a dynamic import cannot be statically resolved.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -36,6 +39,18 @@ pub trait View {
     /// Returns dynamic import behavior.
     #[must_use]
     fn dynamic_imports(&self) -> UnknownDynamicImportBehavior;
+
+    /// Returns TypeScript path mappings used by import resolution.
+    #[must_use]
+    fn path_mappings(&self) -> &[PathMapping] {
+        &[]
+    }
+
+    /// Returns the TypeScript base URL used by import resolution.
+    #[must_use]
+    fn base_url(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Glob pattern text retained as a typed configuration value.
@@ -90,6 +105,45 @@ impl TryFrom<&str> for TestFilePattern {
     }
 }
 
+/// TypeScript path alias mapping from an import pattern to target patterns.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PathMapping {
+    pattern: Box<str>,
+    targets: Box<[Box<str>]>,
+}
+
+impl PathMapping {
+    /// Creates a path mapping from a TS `paths` entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the pattern or target list is empty.
+    pub fn try_new(pattern: &str, targets: Box<[Box<str>]>) -> failure::Result<Self> {
+        if pattern.is_empty() || targets.is_empty() {
+            return Err(failure::AppError::Config {
+                message: Box::<str>::from("path mapping requires a pattern and target"),
+            });
+        }
+
+        Ok(Self {
+            pattern: Box::<str>::from(pattern),
+            targets,
+        })
+    }
+
+    /// Returns the import specifier pattern.
+    #[must_use]
+    pub fn pattern(&self) -> &str {
+        self.pattern.as_ref()
+    }
+
+    /// Returns target path patterns in configured order.
+    #[must_use]
+    pub fn targets(&self) -> &[Box<str>] {
+        self.targets.as_ref()
+    }
+}
+
 /// Raw configuration loaded from the repository boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
@@ -98,6 +152,8 @@ pub struct Config {
     test_patterns: Box<[TestFilePattern]>,
     global_invalidators: Box<[Pattern]>,
     dynamic_imports: UnknownDynamicImportBehavior,
+    path_mappings: Box<[PathMapping]>,
+    base_url: Option<Box<str>>,
 }
 
 /// Resolved configuration consumed by discovery, resolution, and selection.
@@ -108,6 +164,8 @@ pub struct ResolvedConfig {
     test_patterns: Box<[TestFilePattern]>,
     global_invalidators: Box<[Pattern]>,
     dynamic_imports: UnknownDynamicImportBehavior,
+    path_mappings: Box<[PathMapping]>,
+    base_url: Option<Box<str>>,
 }
 
 impl View for ResolvedConfig {
@@ -129,6 +187,14 @@ impl View for ResolvedConfig {
 
     fn dynamic_imports(&self) -> UnknownDynamicImportBehavior {
         self.dynamic_imports
+    }
+
+    fn path_mappings(&self) -> &[PathMapping] {
+        self.path_mappings.as_ref()
+    }
+
+    fn base_url(&self) -> Option<&str> {
+        self.base_url.as_deref()
     }
 }
 
@@ -208,8 +274,6 @@ struct FileConfig {
     test_patterns: Option<Box<[Box<str>]>>,
     global_invalidators: Option<Box<[Box<str>]>>,
     dynamic_imports: Option<UnknownDynamicImportBehavior>,
-<<<<<<< HEAD
-=======
     compiler_options: Option<CompilerOptions>,
 }
 
@@ -229,7 +293,6 @@ struct ParseFileConfigRequest<'a> {
 struct CompilerOptions {
     base_url: Option<Box<str>>,
     paths: Option<RawPathMappings>,
->>>>>>> 21fc016 (fixup! Implement config path and output contracts)
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -265,6 +328,12 @@ impl FileConfig {
         let global_invalidators = self
             .global_invalidators
             .unwrap_or_else(default_global_invalidator_values);
+        let compiler_options = self.compiler_options;
+        let base_url = compile_base_url(
+            compiler_options
+                .as_ref()
+                .and_then(|options| options.base_url.as_deref()),
+        );
 
         Ok(ResolvedConfig {
             source_includes: compile_patterns(source_includes.as_ref())?,
@@ -274,6 +343,8 @@ impl FileConfig {
             dynamic_imports: self
                 .dynamic_imports
                 .unwrap_or(UnknownDynamicImportBehavior::FailClosed),
+            path_mappings: compile_path_mappings(compiler_options)?,
+            base_url,
         })
     }
 }
@@ -321,6 +392,55 @@ fn compile_test_patterns(patterns: &[Box<str>]) -> failure::Result<Box<[TestFile
         .iter()
         .map(|pattern| TestFilePattern::try_from(pattern.as_ref()))
         .collect()
+}
+
+fn compile_path_mappings(
+    compiler_options: Option<CompilerOptions>,
+) -> failure::Result<Box<[PathMapping]>> {
+    let Some(options) = compiler_options else {
+        return Ok(default_path_mappings());
+    };
+    let Some(paths) = options.paths else {
+        return Ok(default_path_mappings());
+    };
+
+    paths
+        .into_iter()
+        .map(|(pattern, targets)| {
+            PathMapping::try_new(
+                pattern.as_ref(),
+                normalize_targets(options.base_url.as_deref(), targets.as_ref()).into_boxed_slice(),
+            )
+        })
+        .collect()
+}
+
+fn compile_base_url(base_url: Option<&str>) -> Option<Box<str>> {
+    base_url.map(trim_current_directory).map(Box::<str>::from)
+}
+
+fn normalize_targets(base_url: Option<&str>, targets: &[Box<str>]) -> Vec<Box<str>> {
+    targets
+        .iter()
+        .map(|target| normalize_target(base_url, target.as_ref()))
+        .collect()
+}
+
+fn normalize_target(base_url: Option<&str>, target: &str) -> Box<str> {
+    let clean_target = trim_current_directory(target);
+    match base_url.map(trim_current_directory) {
+        Some("") | None => Box::<str>::from(clean_target),
+        Some(clean_base_url) if clean_target.is_empty() => Box::<str>::from(clean_base_url),
+        Some(clean_base_url) => Box::<str>::from(format!("{clean_base_url}/{clean_target}")),
+    }
+}
+
+fn trim_current_directory(path: &str) -> &str {
+    if path == "." {
+        ""
+    } else {
+        path.strip_prefix("./").unwrap_or(path)
+    }
 }
 
 fn validate_glob(pattern: &str) -> failure::Result<()> {
@@ -403,6 +523,10 @@ fn default_global_invalidator_values() -> Box<[Box<str>]> {
         Box::<str>::from("bun.lockb"),
         Box::<str>::from("tsconfig.json"),
     ])
+}
+
+fn default_path_mappings() -> Box<[PathMapping]> {
+    Box::from([])
 }
 
 #[cfg(test)]
@@ -494,16 +618,20 @@ mod tests {
 
         // Custom config files let repositories describe their own test naming
         // and fail-closed files without touching host filesystem state.
-        assert!(super::matches_test_file(
-            &config,
-            &roots::RootRelativePath::try_from("app/button.check.ts").unwrap()
-        )
-        .unwrap());
-        assert!(super::matches_global_invalidator(
-            &config,
-            &roots::RootRelativePath::try_from("workspace.json").unwrap()
-        )
-        .unwrap());
+        assert!(
+            super::matches_test_file(
+                &config,
+                &roots::RootRelativePath::try_from("app/button.check.ts").unwrap()
+            )
+            .unwrap()
+        );
+        assert!(
+            super::matches_global_invalidator(
+                &config,
+                &roots::RootRelativePath::try_from("workspace.json").unwrap()
+            )
+            .unwrap()
+        );
         assert_eq!(
             super::View::dynamic_imports(&config),
             super::UnknownDynamicImportBehavior::Ignore,
