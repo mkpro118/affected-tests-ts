@@ -104,6 +104,16 @@ pub struct GraphEdge {
     pub to: Box<str>,
 }
 
+/// Machine-readable explanation output for one selected test.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExplainResult {
+    /// Selected test being explained.
+    pub test_file: Box<str>,
+    /// Stable sorted reason chains that selected the test.
+    pub reasons: Box<[ReasonChain]>,
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -142,5 +152,39 @@ mod tests {
         let result = serde_json::from_str::<super::CommandResult>(JSON);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn graph_and_explain_outputs_use_typed_camel_case_contracts() {
+        let graph = super::GraphResult {
+            nodes: Box::from([super::GraphNode {
+                path: Box::<str>::from("src/button.test.tsx"),
+                kind: super::GraphNodeKind::Test,
+            }]),
+            edges: Box::from([super::GraphEdge {
+                from: Box::<str>::from("src/button.test.tsx"),
+                to: Box::<str>::from("src/button.tsx"),
+            }]),
+        };
+        let explanation = super::ExplainResult {
+            test_file: Box::<str>::from("src/button.test.tsx"),
+            reasons: Box::from([super::ReasonChain {
+                changed_file: Box::<str>::from("src/button.tsx"),
+                test_file: Box::<str>::from("src/button.test.tsx"),
+                path: Box::from([
+                    Box::<str>::from("src/button.tsx"),
+                    Box::<str>::from("src/button.test.tsx"),
+                ]),
+            }]),
+        };
+
+        // Graph and explain output are separate command contracts, but both
+        // still need the same JavaScript-friendly key shape as selection JSON.
+        let graph_json = serde_json::to_string(&graph).unwrap();
+        let explain_json = serde_json::to_string(&explanation).unwrap();
+
+        assert!(graph_json.contains("src/button.test.tsx"));
+        assert!(explain_json.contains("testFile"));
+        assert!(!explain_json.contains("test_file"));
     }
 }

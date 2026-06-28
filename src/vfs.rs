@@ -1,6 +1,7 @@
 //! Test-support virtual filesystem contracts for tests that avoid host state.
 
 use std::collections::BTreeMap;
+use std::sync;
 
 use crate::discovery;
 use crate::failure;
@@ -11,9 +12,9 @@ use crate::roots;
 use crate::settings;
 
 /// In-memory file map used by unit and integration tests.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub struct VirtualFileSystem {
-    files: BTreeMap<roots::RootRelativePath, Box<str>>,
+    files: sync::Arc<sync::Mutex<BTreeMap<roots::RootRelativePath, Box<str>>>>,
 }
 
 impl VirtualFileSystem {
@@ -22,17 +23,58 @@ impl VirtualFileSystem {
     /// # Errors
     ///
     /// Returns an error when the path is not present in the virtual filesystem.
-    pub fn read_text(&self, _path: &roots::RootRelativePath) -> failure::Result<Box<str>> {
-        unimplemented!()
+    pub fn read_text(&self, path: &roots::RootRelativePath) -> failure::Result<Box<str>> {
+        self.snapshot_files()?
+            .get(path)
+            .cloned()
+            .ok_or_else(|| failure::AppError::FileSystem {
+                message: format!("virtual file not found: {}", path.as_str()).into_boxed_str(),
+            })
+    }
+
+    fn snapshot_files(&self) -> failure::Result<BTreeMap<roots::RootRelativePath, Box<str>>> {
+        self.files
+            .lock()
+            .map(|files| files.clone())
+            .map_err(|error| failure::AppError::FileSystem {
+                message: format!("virtual filesystem lock poisoned: {error}").into_boxed_str(),
+            })
+    }
+
+    fn replace_text(&self, path: &roots::RootRelativePath, content: &str) -> failure::Result<()> {
+        self.files
+            .lock()
+            .map_err(|error| failure::AppError::FileSystem {
+                message: format!("virtual filesystem lock poisoned: {error}").into_boxed_str(),
+            })?
+            .insert(path.clone(), Box::<str>::from(content));
+
+        Ok(())
     }
 }
 
-#[cfg(test)]
+impl PartialEq for VirtualFileSystem {
+    fn eq(&self, other: &Self) -> bool {
+        if let (Ok(left_files), Ok(right_files)) = (self.snapshot_files(), other.snapshot_files()) {
+            left_files == right_files
+        } else {
+            false
+        }
+    }
+}
+
+impl Eq for VirtualFileSystem {}
+
+#[cfg(any(test, feature = "test-support"))]
 impl VirtualFileSystem {
-    fn with_files(files: Box<[(roots::RootRelativePath, Box<str>)]>) -> Self {
+    /// Creates a virtual filesystem from root-relative file contents.
+    #[must_use]
+    pub fn with_files(files: Box<[(roots::RootRelativePath, Box<str>)]>) -> Self {
         let files = files.into_vec().into_iter().collect();
 
-        Self { files }
+        Self {
+            files: sync::Arc::new(sync::Mutex::new(files)),
+        }
     }
 }
 
@@ -43,26 +85,36 @@ impl fs::FileReader for VirtualFileSystem {
 }
 
 impl fs::FileMetadataReader for VirtualFileSystem {
-    fn metadata(&self, _path: &roots::RootRelativePath) -> failure::Result<fs::FileMetadata> {
-        unimplemented!()
+    fn metadata(&self, path: &roots::RootRelativePath) -> failure::Result<fs::FileMetadata> {
+        let content = self.read_text(path)?;
+        let byte_len =
+            u64::try_from(content.len()).map_err(|error| failure::AppError::FileSystem {
+                message: format!("virtual file is too large to report metadata: {error}")
+                    .into_boxed_str(),
+            })?;
+
+        Ok(fs::FileMetadata {
+            byte_len,
+            is_directory: false,
+        })
     }
 }
 
 impl fs::DirectoryWalker for VirtualFileSystem {
     fn source_paths(&self) -> failure::Result<Box<[roots::RootRelativePath]>> {
-        unimplemented!()
+        Ok(self.snapshot_files()?.keys().cloned().collect())
     }
 }
 
 impl fs::FileExistence for VirtualFileSystem {
-    fn exists(&self, _path: &roots::RootRelativePath) -> failure::Result<bool> {
-        unimplemented!()
+    fn exists(&self, path: &roots::RootRelativePath) -> failure::Result<bool> {
+        Ok(self.snapshot_files()?.contains_key(path))
     }
 }
 
 impl fs::FileWriter for VirtualFileSystem {
-    fn write_text(&self, _path: &roots::RootRelativePath, _content: &str) -> failure::Result<()> {
-        unimplemented!()
+    fn write_text(&self, path: &roots::RootRelativePath, content: &str) -> failure::Result<()> {
+        self.replace_text(path, content)
     }
 }
 
@@ -80,7 +132,7 @@ impl parser::SourceReader for VirtualFileSystem {
 
 impl discovery::SourceDiscoverer for VirtualFileSystem {
     fn candidate_paths(&self) -> failure::Result<Box<[roots::RootRelativePath]>> {
-        unimplemented!()
+        fs::DirectoryWalker::source_paths(self)
     }
 }
 
@@ -101,7 +153,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "not implemented")]
     fn synthetic_typescript_projects_are_created_without_host_filesystem_state() {
         let file_system = super::VirtualFileSystem::with_files(Box::from([
             (

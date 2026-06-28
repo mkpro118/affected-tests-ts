@@ -1,10 +1,13 @@
 //! Configuration contracts for discovery, resolution, and invalidation rules.
 
+use serde::Deserialize;
+
 use crate::failure;
 use crate::roots;
 
 /// Behavior used when a dynamic import cannot be statically resolved.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub enum UnknownDynamicImportBehavior {
     /// Treat unresolved dynamic imports as selecting the full suite.
     FailClosed,
@@ -49,6 +52,18 @@ impl Pattern {
     }
 }
 
+impl TryFrom<&str> for Pattern {
+    type Error = failure::AppError;
+
+    fn try_from(pattern: &str) -> failure::Result<Self> {
+        validate_glob(pattern)?;
+
+        Ok(Self {
+            value: Box::<str>::from(pattern),
+        })
+    }
+}
+
 /// Glob pattern used to identify test files.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TestFilePattern {
@@ -60,6 +75,18 @@ impl TestFilePattern {
     #[must_use]
     pub fn as_str(&self) -> &str {
         self.value.as_ref()
+    }
+}
+
+impl TryFrom<&str> for TestFilePattern {
+    type Error = failure::AppError;
+
+    fn try_from(pattern: &str) -> failure::Result<Self> {
+        validate_glob(pattern)?;
+
+        Ok(Self {
+            value: Box::<str>::from(pattern),
+        })
     }
 }
 
@@ -128,11 +155,254 @@ pub struct LoadRequest<F> {
 /// # Errors
 ///
 /// Returns an error when configuration input cannot be read or parsed.
-pub fn load<F>(_request: LoadRequest<F>) -> failure::Result<ResolvedConfig>
+pub fn load<F>(request: LoadRequest<F>) -> failure::Result<ResolvedConfig>
 where
     F: LoaderFileSystem,
 {
-    unimplemented!()
+    match request.config_path {
+        Some(config_path) => {
+            let raw_config = request.file_system.read_text(&config_path)?;
+            let config = parse_file_config(&ParseFileConfigRequest {
+                raw_config: raw_config.as_ref(),
+                config_path: &config_path,
+            })?;
+
+            config.resolve()
+        }
+        None => FileConfig::default().resolve(),
+    }
+}
+
+/// Reports whether a root-relative path matches a global invalidator.
+///
+/// # Errors
+///
+/// Returns an error when a configured glob cannot be compiled.
+pub fn matches_global_invalidator<C>(
+    config: &C,
+    path: &roots::RootRelativePath,
+) -> failure::Result<bool>
+where
+    C: View,
+{
+    patterns_match(config.global_invalidators(), path)
+}
+
+/// Reports whether a root-relative path matches configured test-file patterns.
+///
+/// # Errors
+///
+/// Returns an error when a configured glob cannot be compiled.
+pub fn matches_test_file<C>(config: &C, path: &roots::RootRelativePath) -> failure::Result<bool>
+where
+    C: View,
+{
+    test_patterns_match(config.test_patterns(), path)
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FileConfig {
+    source_includes: Option<Box<[Box<str>]>>,
+    excludes: Option<Box<[Box<str>]>>,
+    test_patterns: Option<Box<[Box<str>]>>,
+    global_invalidators: Option<Box<[Box<str>]>>,
+    dynamic_imports: Option<UnknownDynamicImportBehavior>,
+<<<<<<< HEAD
+=======
+    compiler_options: Option<CompilerOptions>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConfigFileKind {
+    AffectedTests,
+    TypeScript,
+}
+
+struct ParseFileConfigRequest<'a> {
+    raw_config: &'a str,
+    config_path: &'a roots::RootRelativePath,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct CompilerOptions {
+    base_url: Option<Box<str>>,
+    paths: Option<RawPathMappings>,
+>>>>>>> 21fc016 (fixup! Implement config path and output contracts)
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct TypeScriptConfig {
+    include: Option<Box<[Box<str>]>>,
+    exclude: Option<Box<[Box<str>]>>,
+    compiler_options: Option<CompilerOptions>,
+}
+
+impl From<TypeScriptConfig> for FileConfig {
+    fn from(config: TypeScriptConfig) -> Self {
+        Self {
+            source_includes: config.include,
+            excludes: config.exclude,
+            test_patterns: None,
+            global_invalidators: None,
+            dynamic_imports: None,
+            compiler_options: config.compiler_options,
+        }
+    }
+}
+
+impl FileConfig {
+    fn resolve(self) -> failure::Result<ResolvedConfig> {
+        let source_includes = self
+            .source_includes
+            .unwrap_or_else(default_source_include_values);
+        let excludes = self.excludes.unwrap_or_else(default_exclude_values);
+        let test_patterns = self
+            .test_patterns
+            .unwrap_or_else(default_test_pattern_values);
+        let global_invalidators = self
+            .global_invalidators
+            .unwrap_or_else(default_global_invalidator_values);
+
+        Ok(ResolvedConfig {
+            source_includes: compile_patterns(source_includes.as_ref())?,
+            excludes: compile_patterns(excludes.as_ref())?,
+            test_patterns: compile_test_patterns(test_patterns.as_ref())?,
+            global_invalidators: compile_patterns(global_invalidators.as_ref())?,
+            dynamic_imports: self
+                .dynamic_imports
+                .unwrap_or(UnknownDynamicImportBehavior::FailClosed),
+        })
+    }
+}
+
+fn parse_file_config(request: &ParseFileConfigRequest<'_>) -> failure::Result<FileConfig> {
+    match config_file_kind(request.config_path) {
+        ConfigFileKind::AffectedTests => parse_affected_tests_config(request.raw_config),
+        ConfigFileKind::TypeScript => parse_typescript_config(request.raw_config),
+    }
+}
+
+fn config_file_kind(config_path: &roots::RootRelativePath) -> ConfigFileKind {
+    if config_path.as_str() == "tsconfig.json" {
+        ConfigFileKind::TypeScript
+    } else {
+        ConfigFileKind::AffectedTests
+    }
+}
+
+fn parse_affected_tests_config(raw_config: &str) -> failure::Result<FileConfig> {
+    serde_json::from_str(raw_config).map_err(|error| parse_config_error(&error))
+}
+
+fn parse_typescript_config(raw_config: &str) -> failure::Result<FileConfig> {
+    serde_json::from_str::<TypeScriptConfig>(raw_config)
+        .map(FileConfig::from)
+        .map_err(|error| parse_config_error(&error))
+}
+
+fn parse_config_error(error: &serde_json::Error) -> failure::AppError {
+    failure::AppError::Config {
+        message: format!("failed to parse config: {error}").into_boxed_str(),
+    }
+}
+
+fn compile_patterns(patterns: &[Box<str>]) -> failure::Result<Box<[Pattern]>> {
+    patterns
+        .iter()
+        .map(|pattern| Pattern::try_from(pattern.as_ref()))
+        .collect()
+}
+
+fn compile_test_patterns(patterns: &[Box<str>]) -> failure::Result<Box<[TestFilePattern]>> {
+    patterns
+        .iter()
+        .map(|pattern| TestFilePattern::try_from(pattern.as_ref()))
+        .collect()
+}
+
+fn validate_glob(pattern: &str) -> failure::Result<()> {
+    globset::Glob::new(pattern)
+        .map(|_glob| ())
+        .map_err(|error| failure::AppError::Config {
+            message: format!("invalid glob pattern `{pattern}`: {error}").into_boxed_str(),
+        })
+}
+
+fn patterns_match(patterns: &[Pattern], path: &roots::RootRelativePath) -> failure::Result<bool> {
+    let glob_set = build_glob_set(patterns)?;
+
+    Ok(glob_set.is_match(path.as_str()))
+}
+
+fn test_patterns_match(
+    patterns: &[TestFilePattern],
+    path: &roots::RootRelativePath,
+) -> failure::Result<bool> {
+    let mut builder = globset::GlobSetBuilder::new();
+    for pattern in patterns {
+        let glob =
+            globset::Glob::new(pattern.as_str()).map_err(|error| failure::AppError::Config {
+                message: format!("invalid test glob pattern `{}`: {error}", pattern.as_str())
+                    .into_boxed_str(),
+            })?;
+        builder.add(glob);
+    }
+
+    let glob_set = builder.build().map_err(|error| failure::AppError::Config {
+        message: format!("failed to compile test glob set: {error}").into_boxed_str(),
+    })?;
+
+    Ok(glob_set.is_match(path.as_str()))
+}
+
+fn build_glob_set(patterns: &[Pattern]) -> failure::Result<globset::GlobSet> {
+    let mut builder = globset::GlobSetBuilder::new();
+    for pattern in patterns {
+        let glob =
+            globset::Glob::new(pattern.as_str()).map_err(|error| failure::AppError::Config {
+                message: format!("invalid glob pattern `{}`: {error}", pattern.as_str())
+                    .into_boxed_str(),
+            })?;
+        builder.add(glob);
+    }
+
+    builder.build().map_err(|error| failure::AppError::Config {
+        message: format!("failed to compile glob set: {error}").into_boxed_str(),
+    })
+}
+
+fn default_source_include_values() -> Box<[Box<str>]> {
+    Box::from([Box::<str>::from("**/*.ts"), Box::<str>::from("**/*.tsx")])
+}
+
+fn default_exclude_values() -> Box<[Box<str>]> {
+    Box::from([
+        Box::<str>::from("node_modules/**"),
+        Box::<str>::from("dist/**"),
+        Box::<str>::from("build/**"),
+        Box::<str>::from(".next/**"),
+    ])
+}
+
+fn default_test_pattern_values() -> Box<[Box<str>]> {
+    Box::from([
+        Box::<str>::from("**/*.test.ts"),
+        Box::<str>::from("**/*.test.tsx"),
+        Box::<str>::from("**/*.spec.ts"),
+        Box::<str>::from("**/*.spec.tsx"),
+        Box::<str>::from("**/__tests__/**/*"),
+    ])
+}
+
+fn default_global_invalidator_values() -> Box<[Box<str>]> {
+    Box::from([
+        Box::<str>::from("package.json"),
+        Box::<str>::from("bun.lockb"),
+        Box::<str>::from("tsconfig.json"),
+    ])
 }
 
 #[cfg(test)]
@@ -170,7 +440,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "not implemented")]
     fn defaults_match_prd_patterns_and_invalidators_are_stable() {
         let request = super::LoadRequest {
             file_system: FixtureFileSystem::default(),
@@ -202,5 +471,165 @@ mod tests {
             super::View::dynamic_imports(&config),
             super::UnknownDynamicImportBehavior::FailClosed,
         );
+    }
+
+    #[test]
+    fn loaded_config_overrides_defaults_and_matches_paths() {
+        let request = super::LoadRequest {
+            file_system: FixtureFileSystem {
+                content: Some(Box::<str>::from(
+                    r#"{
+  "sourceIncludes": ["app/**/*.ts"],
+  "excludes": ["app/generated/**"],
+  "testPatterns": ["app/**/*.check.ts"],
+  "globalInvalidators": ["workspace.json"],
+  "dynamicImports": "ignore"
+}"#,
+                )),
+            },
+            config_path: Some(roots::RootRelativePath::try_from("affected-tests.json").unwrap()),
+        };
+
+        let config = super::load(request).unwrap();
+
+        // Custom config files let repositories describe their own test naming
+        // and fail-closed files without touching host filesystem state.
+        assert!(super::matches_test_file(
+            &config,
+            &roots::RootRelativePath::try_from("app/button.check.ts").unwrap()
+        )
+        .unwrap());
+        assert!(super::matches_global_invalidator(
+            &config,
+            &roots::RootRelativePath::try_from("workspace.json").unwrap()
+        )
+        .unwrap());
+        assert_eq!(
+            super::View::dynamic_imports(&config),
+            super::UnknownDynamicImportBehavior::Ignore,
+        );
+    }
+
+    #[test]
+    fn affected_tests_config_rejects_singular_exclude_typo() {
+        let request = super::LoadRequest {
+            file_system: FixtureFileSystem {
+                content: Some(Box::<str>::from(
+                    r#"{
+  "exclude": ["generated/**"]
+}"#,
+                )),
+            },
+            config_path: Some(roots::RootRelativePath::try_from("affected-tests.json").unwrap()),
+        };
+
+        let error = super::load(request).unwrap_err();
+
+        // The tool-specific config stays strict so misspelled settings do not
+        // silently change affected-test selection.
+        assert!(error.to_string().contains("unknown field `exclude`"));
+    }
+
+    #[test]
+    fn tsconfig_allows_typescript_fields_and_maps_include_exclude() {
+        let request = super::LoadRequest {
+            file_system: FixtureFileSystem {
+                content: Some(Box::<str>::from(
+                    r#"{
+  "extends": "./tsconfig.base.json",
+  "include": ["src/**/*.ts"],
+  "exclude": ["src/generated/**"],
+  "references": [{ "path": "../shared" }],
+  "compilerOptions": {
+    "target": "ES2022",
+    "baseUrl": ".",
+    "paths": {
+      "@lib/*": ["src/lib/*"]
+    }
+  }
+}"#,
+                )),
+            },
+            config_path: Some(roots::RootRelativePath::try_from("tsconfig.json").unwrap()),
+        };
+
+        let config = super::load(request).unwrap();
+
+        // Real tsconfig files contain TypeScript metadata outside this tool's
+        // contract; we preserve the fields that affect discovery/resolution.
+        assert_eq!(
+            pattern_values(super::View::source_includes(&config)),
+            Box::<[Box<str>]>::from([Box::<str>::from("src/**/*.ts")]),
+        );
+        assert_eq!(
+            pattern_values(super::View::excludes(&config)),
+            Box::<[Box<str>]>::from([Box::<str>::from("src/generated/**")]),
+        );
+        assert_eq!(super::View::base_url(&config), Some(""));
+        assert_eq!(
+            super::View::path_mappings(&config),
+            &[
+                super::PathMapping::try_new("@lib/*", Box::from([Box::<str>::from("src/lib/*")]),)
+                    .unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn loaded_compiler_options_paths_are_exposed_for_resolution() {
+        let request = super::LoadRequest {
+            file_system: FixtureFileSystem {
+                content: Some(Box::<str>::from(
+                    r#"{
+  "compilerOptions": {
+    "target": "ES2022",
+    "baseUrl": ".",
+    "paths": {
+      "@lib/*": ["src/lib/*"]
+    }
+  }
+}"#,
+                )),
+            },
+            config_path: Some(roots::RootRelativePath::try_from("tsconfig.json").unwrap()),
+        };
+
+        let config = super::load(request).unwrap();
+        let mappings = super::View::path_mappings(&config);
+
+        // TS path aliases must stay typed at the config boundary so resolution can
+        // distinguish local aliases from external package imports. Real tsconfig
+        // files include unrelated compiler options that should not affect this.
+        assert_eq!(
+            mappings,
+            &[
+                super::PathMapping::try_new("@lib/*", Box::from([Box::<str>::from("src/lib/*")]),)
+                    .unwrap()
+            ]
+        );
+        assert_eq!(super::View::base_url(&config), Some(""));
+    }
+
+    #[test]
+    fn loaded_base_url_without_paths_is_exposed_for_resolution() {
+        let request = super::LoadRequest {
+            file_system: FixtureFileSystem {
+                content: Some(Box::<str>::from(
+                    r#"{
+  "compilerOptions": {
+    "baseUrl": "src"
+  }
+}"#,
+                )),
+            },
+            config_path: Some(roots::RootRelativePath::try_from("tsconfig.json").unwrap()),
+        };
+
+        let config = super::load(request).unwrap();
+
+        // Repositories often use baseUrl without explicit paths; resolver needs
+        // that local root without forcing package imports into the graph.
+        assert_eq!(super::View::base_url(&config), Some("src"));
+        assert_eq!(super::View::path_mappings(&config), &[]);
     }
 }
