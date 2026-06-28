@@ -134,3 +134,73 @@ where
 {
     unimplemented!()
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::failure;
+    use crate::roots;
+
+    #[derive(Clone, Debug, Default)]
+    struct FixtureFileSystem {
+        content: Option<Box<str>>,
+    }
+
+    impl super::LoaderFileSystem for FixtureFileSystem {
+        fn read_text(&self, _path: &roots::RootRelativePath) -> failure::Result<Box<str>> {
+            self.content
+                .clone()
+                .ok_or_else(|| failure::AppError::Config {
+                    message: Box::<str>::from("fixture config missing"),
+                })
+        }
+    }
+
+    fn pattern_values(patterns: &[super::Pattern]) -> Box<[Box<str>]> {
+        patterns
+            .iter()
+            .map(|pattern| Box::<str>::from(pattern.as_str()))
+            .collect()
+    }
+
+    fn test_pattern_values(patterns: &[super::TestFilePattern]) -> Box<[Box<str>]> {
+        patterns
+            .iter()
+            .map(|pattern| Box::<str>::from(pattern.as_str()))
+            .collect()
+    }
+
+    #[test]
+    #[should_panic(expected = "not implemented")]
+    fn defaults_match_prd_patterns_and_invalidators_are_stable() {
+        let request = super::LoadRequest {
+            file_system: FixtureFileSystem::default(),
+            config_path: None,
+        };
+
+        let config = super::load(request).unwrap();
+
+        // These defaults represent the V1 TypeScript project shape from the PRD.
+        assert_eq!(
+            test_pattern_values(super::View::test_patterns(&config)),
+            Box::<[Box<str>]>::from([
+                Box::<str>::from("**/*.test.ts"),
+                Box::<str>::from("**/*.test.tsx"),
+                Box::<str>::from("**/*.spec.ts"),
+                Box::<str>::from("**/*.spec.tsx"),
+                Box::<str>::from("**/__tests__/**/*"),
+            ]),
+        );
+        assert_eq!(
+            pattern_values(super::View::global_invalidators(&config)),
+            Box::<[Box<str>]>::from([
+                Box::<str>::from("package.json"),
+                Box::<str>::from("bun.lockb"),
+                Box::<str>::from("tsconfig.json"),
+            ]),
+        );
+        assert_eq!(
+            super::View::dynamic_imports(&config),
+            super::UnknownDynamicImportBehavior::FailClosed,
+        );
+    }
+}

@@ -72,3 +72,62 @@ where
 {
     unimplemented!()
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::contract;
+    use crate::failure;
+    use crate::progress;
+
+    #[derive(Clone, Debug, Default)]
+    struct RecordingTerminal {
+        frames: Vec<super::Model>,
+    }
+
+    impl super::Terminal for RecordingTerminal {
+        fn draw_frame(&mut self, model: &super::Model) -> failure::Result<()> {
+            self.frames.push(model.clone());
+
+            Ok(())
+        }
+    }
+
+    fn panel(id: &str, title: &str) -> super::TuiPanel {
+        super::TuiPanel {
+            id: Box::<str>::from(id),
+            title: Box::<str>::from(title),
+        }
+    }
+
+    fn layout() -> super::TuiLayout {
+        super::TuiLayout {
+            header: panel("header", "affected-tests"),
+            phase_rail: panel("phases", "Phases"),
+            trace_workspace: panel("active-traces", "Active Traces"),
+            reuse_pane: panel("reuse", "Shared Work"),
+            summary_pane: panel("selected-tests", "Selected Tests"),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "not implemented")]
+    fn renders_dashboard_reuse_selected_tests_and_fail_closed_overlay_from_typed_events() {
+        let model = super::Model {
+            layout: layout(),
+            phase: progress::Phase::Tracing,
+            active_traces: Box::from([Box::<str>::from("src/file-d.ts")]),
+            reused_traces: Box::from([Box::<str>::from("src/file-b.ts")]),
+            result: Some(contract::CommandResult::Full(contract::FullResult {
+                reason: Box::<str>::from("global invalidator changed: tsconfig.json"),
+            })),
+        };
+        let request = super::Request {
+            terminal: RecordingTerminal::default(),
+            model,
+        };
+
+        // The TUI receives typed state so rendering can change without mutating
+        // selection behavior or reinterpreting terminal escape output.
+        super::render(request).unwrap();
+    }
+}

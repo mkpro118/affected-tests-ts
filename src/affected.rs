@@ -108,3 +108,212 @@ where
 {
     unimplemented!()
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use crate::roots;
+    use crate::vcs;
+
+    #[derive(Clone, Debug)]
+    struct FixtureGraph {
+        reverse_edges: BTreeMap<roots::RootRelativePath, Box<[roots::RootRelativePath]>>,
+        empty: Box<[roots::RootRelativePath]>,
+    }
+
+    impl super::GraphView for FixtureGraph {
+        fn reverse_dependents(&self, path: &roots::RootRelativePath) -> &[roots::RootRelativePath] {
+            self.reverse_edges
+                .get(path)
+                .map_or_else(|| self.empty.as_ref(), Box::as_ref)
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct AlternateGraph {
+        dependent: roots::RootRelativePath,
+    }
+
+    impl super::GraphView for AlternateGraph {
+        fn reverse_dependents(
+            &self,
+            _path: &roots::RootRelativePath,
+        ) -> &[roots::RootRelativePath] {
+            std::slice::from_ref(&self.dependent)
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct FixtureClassifier {
+        tests: BTreeSet<roots::RootRelativePath>,
+        invalidators: BTreeSet<roots::RootRelativePath>,
+    }
+
+    impl super::PathClassifier for FixtureClassifier {
+        fn is_test(&self, path: &roots::RootRelativePath) -> bool {
+            self.tests.contains(path)
+        }
+
+        fn is_global_invalidator(&self, path: &roots::RootRelativePath) -> bool {
+            self.invalidators.contains(path)
+        }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct FixtureAlwaysRun {
+        tests: Box<[roots::RootRelativePath]>,
+    }
+
+    impl super::AlwaysRun for FixtureAlwaysRun {
+        fn always_run_tests(&self) -> &[roots::RootRelativePath] {
+            self.tests.as_ref()
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct FixtureChanges {
+        files: Box<[vcs::ChangedFile]>,
+    }
+
+    impl vcs::ChangeSetView for FixtureChanges {
+        fn files(&self) -> &[vcs::ChangedFile] {
+            self.files.as_ref()
+        }
+    }
+
+    fn path(value: &str) -> roots::RootRelativePath {
+        roots::RootRelativePath::try_from(value).unwrap()
+    }
+
+    fn changed(status: vcs::ChangedFileStatus, value: &str) -> vcs::ChangedFile {
+        vcs::ChangedFile {
+            status,
+            path: path(value),
+            previous_path: None,
+        }
+    }
+
+    fn classifier() -> FixtureClassifier {
+        FixtureClassifier {
+            tests: BTreeSet::from([path("src/file-a.test.ts"), path("src/file-d.test.tsx")]),
+            invalidators: BTreeSet::from([path("tsconfig.json")]),
+        }
+    }
+
+    fn graph() -> FixtureGraph {
+        FixtureGraph {
+            reverse_edges: BTreeMap::from([
+                (
+                    path("src/file-a.ts"),
+                    Box::from([path("src/file-a.test.ts")]),
+                ),
+                (
+                    path("src/file-d.ts"),
+                    Box::from([path("src/file-d.test.tsx")]),
+                ),
+            ]),
+            empty: Box::from([]),
+        }
+    }
+
+    fn request(
+        changes: Box<[vcs::ChangedFile]>,
+    ) -> super::SelectionRequest<FixtureGraph, FixtureClassifier, FixtureAlwaysRun, FixtureChanges>
+    {
+        super::SelectionRequest {
+            graph: graph(),
+            classifier: classifier(),
+            always_run: FixtureAlwaysRun::default(),
+            changes: FixtureChanges { files: changes },
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "not implemented")]
+    fn returns_partial_for_transitive_dependents_and_includes_changed_tests() {
+        let request = request(Box::from([
+            changed(vcs::ChangedFileStatus::Modified, "src/file-a.ts"),
+            changed(vcs::ChangedFileStatus::Modified, "src/file-d.test.tsx"),
+        ]));
+
+        // A source change plus a changed test proves selector behavior covers both
+        // reverse graph traversal and the direct "run the edited test" rule.
+        let result = super::select(request).unwrap();
+
+        assert_eq!(
+            result,
+            super::AffectedResult::Partial(super::PartialDecision {
+                tests: Box::from([path("src/file-a.test.ts"), path("src/file-d.test.tsx")]),
+                reasons: Box::from([]),
+            }),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "not implemented")]
+    fn returns_none_for_docs_only_changes_without_always_run_tests() {
+        let result = super::select(request(Box::from([changed(
+            vcs::ChangedFileStatus::Modified,
+            "docs/usage.md",
+        )])))
+        .unwrap();
+
+        assert_eq!(result, super::AffectedResult::None);
+    }
+
+    #[test]
+    #[should_panic(expected = "not implemented")]
+    fn returns_full_for_global_invalidators_and_deleted_source_files() {
+        let global_result = super::select(request(Box::from([changed(
+            vcs::ChangedFileStatus::Modified,
+            "tsconfig.json",
+        )])))
+        .unwrap();
+
+        assert_eq!(
+            global_result,
+            super::AffectedResult::Full(super::FullReason::GlobalInvalidator(path(
+                "tsconfig.json",
+            ))),
+        );
+
+        let deleted_result = super::select(request(Box::from([changed(
+            vcs::ChangedFileStatus::Deleted,
+            "src/file-a.ts",
+        )])))
+        .unwrap();
+
+        assert_eq!(
+            deleted_result,
+            super::AffectedResult::Full(super::FullReason::DeletedFile(path("src/file-a.ts"))),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "not implemented")]
+    fn public_api_accepts_alternate_trait_implementations_without_module_changes() {
+        let request = super::SelectionRequest {
+            graph: AlternateGraph {
+                dependent: path("src/file-a.test.ts"),
+            },
+            classifier: classifier(),
+            always_run: FixtureAlwaysRun::default(),
+            changes: FixtureChanges {
+                files: Box::from([changed(vcs::ChangedFileStatus::Modified, "src/file-a.ts")]),
+            },
+        };
+
+        // This alternate graph proves callers depend on the selector capability
+        // traits, not on the concrete graph type owned by the graph module.
+        let result = super::select(request).unwrap();
+
+        assert_eq!(
+            result,
+            super::AffectedResult::Partial(super::PartialDecision {
+                tests: Box::from([path("src/file-a.test.ts")]),
+                reasons: Box::from([]),
+            }),
+        );
+    }
+}

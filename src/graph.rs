@@ -70,3 +70,61 @@ where
 {
     unimplemented!()
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use crate::failure;
+    use crate::roots;
+
+    #[derive(Clone, Debug)]
+    struct FixtureImports {
+        edges: BTreeMap<roots::RootRelativePath, Box<[roots::RootRelativePath]>>,
+        empty: Box<[roots::RootRelativePath]>,
+    }
+
+    impl super::ImportResolver for FixtureImports {
+        fn dependencies_for(
+            &self,
+            path: &roots::RootRelativePath,
+        ) -> failure::Result<Box<[roots::RootRelativePath]>> {
+            Ok(self
+                .edges
+                .get(path)
+                .map_or_else(|| self.empty.clone(), Clone::clone))
+        }
+    }
+
+    fn path(value: &str) -> roots::RootRelativePath {
+        roots::RootRelativePath::try_from(value).unwrap()
+    }
+
+    #[test]
+    #[should_panic(expected = "not implemented")]
+    fn builds_forward_edges_and_reverse_edges_for_importers_and_imports() {
+        let file_a = path("src/file-a.ts");
+        let file_b = path("src/file-b.ts");
+        let imports = FixtureImports {
+            edges: BTreeMap::from([(file_a.clone(), Box::from([file_b.clone()]))]),
+            empty: Box::from([]),
+        };
+        let request = super::GraphBuildRequest {
+            imports,
+            files: Box::from([file_a.clone(), file_b.clone()]),
+        };
+
+        // A single A -> B import is the smallest fixture that proves both graph
+        // directions are populated for selectors and explain output.
+        let graph = super::build(request).unwrap();
+
+        assert_eq!(
+            super::GraphView::dependencies(&graph, &file_a),
+            std::slice::from_ref(&file_b),
+        );
+        assert_eq!(
+            super::GraphView::reverse_dependents(&graph, &file_b),
+            &[file_a]
+        );
+    }
+}

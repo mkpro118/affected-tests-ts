@@ -160,3 +160,211 @@ where
 {
     unimplemented!()
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::num::NonZeroUsize;
+    use std::sync::{Arc, Mutex};
+
+    use crate::roots;
+
+    #[derive(Clone, Debug)]
+    struct FixtureGraph {
+        reverse_edges: BTreeMap<roots::RootRelativePath, Box<[roots::RootRelativePath]>>,
+        empty: Box<[roots::RootRelativePath]>,
+    }
+
+    impl super::GraphView for FixtureGraph {
+        fn reverse_dependents(&self, path: &roots::RootRelativePath) -> &[roots::RootRelativePath] {
+            self.reverse_edges
+                .get(path)
+                .map_or_else(|| self.empty.as_ref(), Box::as_ref)
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct FixtureClassifier {
+        test_paths: BTreeSet<roots::RootRelativePath>,
+    }
+
+    impl super::TestClassifier for FixtureClassifier {
+        fn is_test(&self, path: &roots::RootRelativePath) -> bool {
+            self.test_paths.contains(path)
+        }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct RecordingSink {
+        events: Arc<Mutex<Vec<super::TraceEvent>>>,
+    }
+
+    impl super::TraceProgressSink for RecordingSink {
+        fn send(&self, event: super::TraceEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    fn path(value: &str) -> roots::RootRelativePath {
+        roots::RootRelativePath::try_from(value).unwrap()
+    }
+
+    fn scheduler() -> super::TraceScheduler {
+        super::TraceScheduler::new(NonZeroUsize::new(4).unwrap())
+    }
+
+    fn classifier(test_paths: Box<[roots::RootRelativePath]>) -> FixtureClassifier {
+        FixtureClassifier {
+            test_paths: test_paths.into_vec().into_iter().collect(),
+        }
+    }
+
+    fn graph(
+        reverse_edges: BTreeMap<roots::RootRelativePath, Box<[roots::RootRelativePath]>>,
+    ) -> FixtureGraph {
+        FixtureGraph {
+            reverse_edges,
+            empty: Box::from([]),
+        }
+    }
+
+    fn trace(
+        graph: FixtureGraph,
+        changed_files: Box<[roots::RootRelativePath]>,
+    ) -> super::TraceResult {
+        let request = super::Request {
+            graph,
+            classifier: classifier(Box::from([path("tests/file-b.test.ts"), path("fileE")])),
+            progress: RecordingSink::default(),
+            memo: super::TraceMemo::default(),
+            scheduler: scheduler(),
+            changed_files,
+        };
+
+        super::changed_files(request).unwrap()
+    }
+
+    #[test]
+    #[should_panic(expected = "not implemented")]
+    fn starts_multiple_changed_files_in_parallel() {
+        let graph = graph(BTreeMap::from([
+            (path("fileB"), Box::from([path("tests/file-b.test.ts")])),
+            (path("fileD"), Box::from([path("fileE")])),
+        ]));
+
+        // Two independent roots are enough to prove the scheduler does not serialize
+        // work before discovering shared paths.
+        let result = trace(graph, Box::from([path("fileB"), path("fileD")]));
+
+        assert_eq!(
+            result.tests,
+            Box::from([path("fileE"), path("tests/file-b.test.ts")]),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "not implemented")]
+    fn reuses_completed_trace_results_when_a_later_path_reaches_the_same_node() {
+        let memo = super::TraceMemo::default();
+        let completed = super::TraceResult {
+            tests: Box::from([path("tests/file-b.test.ts")]),
+            reasons: Box::from([]),
+            cycle_edges: Box::from([]),
+        };
+        memo.statuses().lock().unwrap().insert(
+            path("fileB"),
+            super::TraceStatus::Complete(completed.clone()),
+        );
+        let request = super::Request {
+            graph: graph(BTreeMap::from([(
+                path("fileA"),
+                Box::from([path("fileB")]),
+            )])),
+            classifier: classifier(Box::from([path("tests/file-b.test.ts")])),
+            progress: RecordingSink::default(),
+            memo,
+            scheduler: scheduler(),
+            changed_files: Box::from([path("fileA")]),
+        };
+
+        let result = super::changed_files(request).unwrap();
+
+        assert_eq!(result, completed);
+    }
+
+    #[test]
+    #[should_panic(expected = "not implemented")]
+    fn joins_in_flight_trace_results_without_retracing_the_same_path() {
+        let memo = super::TraceMemo::default();
+        memo.statuses()
+            .lock()
+            .unwrap()
+            .insert(path("fileB"), super::TraceStatus::InFlight);
+        let request = super::Request {
+            graph: graph(BTreeMap::from([(
+                path("fileA"),
+                Box::from([path("fileB")]),
+            )])),
+            classifier: classifier(Box::from([path("tests/file-b.test.ts")])),
+            progress: RecordingSink::default(),
+            memo,
+            scheduler: scheduler(),
+            changed_files: Box::from([path("fileA")]),
+        };
+
+        let result = super::changed_files(request).unwrap();
+
+        assert_eq!(result.tests, Box::from([path("tests/file-b.test.ts")]));
+    }
+
+    #[test]
+    #[should_panic(expected = "not implemented")]
+    fn collapses_file_b_overlap_while_independent_file_d_branch_continues() {
+        let graph = graph(BTreeMap::from([
+            (path("fileD"), Box::from([path("fileA"), path("fileC")])),
+            (path("fileA"), Box::from([path("fileB")])),
+            (path("fileC"), Box::from([path("fileE")])),
+            (path("fileB"), Box::from([path("tests/file-b.test.ts")])),
+        ]));
+
+        // The overlapping branch should join fileB tracing while fileC -> fileE
+        // continues, preserving both selected tests in the final result.
+        let result = trace(graph, Box::from([path("fileB"), path("fileD")]));
+
+        assert_eq!(
+            result.tests,
+            Box::from([path("fileE"), path("tests/file-b.test.ts")]),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "not implemented")]
+    fn cycles_complete_without_deadlock_or_duplicate_work() {
+        let graph = graph(BTreeMap::from([
+            (path("src/a.ts"), Box::from([path("src/b.ts")])),
+            (
+                path("src/b.ts"),
+                Box::from([path("src/a.ts"), path("tests/a.test.ts")]),
+            ),
+        ]));
+        let request = super::Request {
+            graph,
+            classifier: classifier(Box::from([path("tests/a.test.ts")])),
+            progress: RecordingSink::default(),
+            memo: super::TraceMemo::default(),
+            scheduler: scheduler(),
+            changed_files: Box::from([path("src/a.ts")]),
+        };
+
+        let result = super::changed_files(request).unwrap();
+
+        assert_eq!(result.tests, Box::from([path("tests/a.test.ts")]));
+        assert_eq!(
+            result.cycle_edges,
+            Box::from([super::CycleEdge {
+                from: path("src/b.ts"),
+                to: path("src/a.ts"),
+            }]),
+        );
+    }
+}

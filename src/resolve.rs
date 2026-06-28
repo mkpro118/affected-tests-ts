@@ -62,3 +62,110 @@ where
 {
     unimplemented!()
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use crate::failure;
+    use crate::roots;
+    use crate::settings;
+
+    #[derive(Clone, Debug, Default)]
+    struct FixtureConfig {
+        source_includes: Box<[settings::Pattern]>,
+        excludes: Box<[settings::Pattern]>,
+        test_patterns: Box<[settings::TestFilePattern]>,
+        global_invalidators: Box<[settings::Pattern]>,
+    }
+
+    impl settings::View for FixtureConfig {
+        fn source_includes(&self) -> &[settings::Pattern] {
+            self.source_includes.as_ref()
+        }
+
+        fn excludes(&self) -> &[settings::Pattern] {
+            self.excludes.as_ref()
+        }
+
+        fn test_patterns(&self) -> &[settings::TestFilePattern] {
+            self.test_patterns.as_ref()
+        }
+
+        fn global_invalidators(&self) -> &[settings::Pattern] {
+            self.global_invalidators.as_ref()
+        }
+
+        fn dynamic_imports(&self) -> settings::UnknownDynamicImportBehavior {
+            settings::UnknownDynamicImportBehavior::FailClosed
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct FixtureProbe {
+        existing_paths: BTreeSet<roots::RootRelativePath>,
+    }
+
+    impl super::FileExistence for FixtureProbe {
+        fn exists(&self, path: &roots::RootRelativePath) -> failure::Result<bool> {
+            Ok(self.existing_paths.contains(path))
+        }
+    }
+
+    fn path(value: &str) -> roots::RootRelativePath {
+        roots::RootRelativePath::try_from(value).unwrap()
+    }
+
+    fn specifier(value: &str) -> roots::ImportSpecifier {
+        roots::ImportSpecifier::try_from(value).unwrap()
+    }
+
+    #[test]
+    #[should_panic(expected = "not implemented")]
+    fn resolves_relative_extensions_indexes_and_ts_path_aliases() {
+        let probe = FixtureProbe {
+            existing_paths: BTreeSet::from([
+                path("src/components/button.tsx"),
+                path("src/components/menu/index.ts"),
+                path("src/shared/date.ts"),
+            ]),
+        };
+        let relative_request = super::ResolveRequest {
+            config: FixtureConfig::default(),
+            probe: probe.clone(),
+            importer: path("src/pages/home.tsx"),
+            specifier: specifier("../components/button"),
+        };
+
+        // The fixture names extensionless, index, and alias-shaped imports because
+        // these are the resolution cases that determine graph completeness.
+        assert_eq!(
+            super::import(relative_request).unwrap(),
+            super::Outcome::Resolved(path("src/components/button.tsx")),
+        );
+
+        let index_request = super::ResolveRequest {
+            config: FixtureConfig::default(),
+            probe: probe.clone(),
+            importer: path("src/pages/home.tsx"),
+            specifier: specifier("../components/menu"),
+        };
+
+        assert_eq!(
+            super::import(index_request).unwrap(),
+            super::Outcome::Resolved(path("src/components/menu/index.ts")),
+        );
+
+        let alias_request = super::ResolveRequest {
+            config: FixtureConfig::default(),
+            probe,
+            importer: path("src/pages/home.tsx"),
+            specifier: specifier("@shared/date"),
+        };
+
+        assert_eq!(
+            super::import(alias_request).unwrap(),
+            super::Outcome::Resolved(path("src/shared/date.ts")),
+        );
+    }
+}

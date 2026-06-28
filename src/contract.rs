@@ -103,3 +103,44 @@ pub struct GraphEdge {
     /// Imported file path.
     pub to: Box<str>,
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn command_result_json_uses_camel_case_reason_fields() {
+        let result = super::CommandResult::Partial(super::PartialResult {
+            tests: Box::from([Box::<str>::from("src/button.test.tsx")]),
+            reasons: Box::from([super::ReasonChain {
+                changed_file: Box::<str>::from("src/button.tsx"),
+                test_file: Box::<str>::from("src/button.test.tsx"),
+                path: Box::from([
+                    Box::<str>::from("src/button.tsx"),
+                    Box::<str>::from("src/button.test.tsx"),
+                ]),
+            }]),
+        });
+
+        // The JSON shape is consumed by JavaScript tooling, so snake_case keys
+        // would be a breaking cross-language contract.
+        let json = serde_json::to_string(&result).unwrap();
+
+        assert!(json.contains("changedFile"));
+        assert!(json.contains("testFile"));
+        assert!(!json.contains("changed_file"));
+        assert!(!json.contains("test_file"));
+    }
+
+    #[test]
+    fn command_result_deserialization_rejects_unexpected_fields() {
+        const JSON: &str = r#"{
+  "status": "partial",
+  "tests": ["src/button.test.tsx"],
+  "reasons": [],
+  "unexpectedField": true
+}"#;
+
+        let result = serde_json::from_str::<super::CommandResult>(JSON);
+
+        assert!(result.is_err());
+    }
+}

@@ -27,6 +27,15 @@ impl VirtualFileSystem {
     }
 }
 
+#[cfg(test)]
+impl VirtualFileSystem {
+    fn with_files(files: Box<[(roots::RootRelativePath, Box<str>)]>) -> Self {
+        let files = files.into_vec().into_iter().collect();
+
+        Self { files }
+    }
+}
+
 impl fs::FileReader for VirtualFileSystem {
     fn read_text(&self, path: &roots::RootRelativePath) -> failure::Result<Box<str>> {
         Self::read_text(self, path)
@@ -78,5 +87,49 @@ impl discovery::SourceDiscoverer for VirtualFileSystem {
 impl modules::FileExistence for VirtualFileSystem {
     fn exists(&self, path: &roots::RootRelativePath) -> failure::Result<bool> {
         fs::FileExistence::exists(self, path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::discovery;
+    use crate::fs;
+    use crate::roots;
+
+    fn path(value: &str) -> roots::RootRelativePath {
+        roots::RootRelativePath::try_from(value).unwrap()
+    }
+
+    #[test]
+    #[should_panic(expected = "not implemented")]
+    fn synthetic_typescript_projects_are_created_without_host_filesystem_state() {
+        let file_system = super::VirtualFileSystem::with_files(Box::from([
+            (
+                path("src/accounts/service.ts"),
+                Box::<str>::from("import { button } from '../ui/button';"),
+            ),
+            (
+                path("src/ui/button.tsx"),
+                Box::<str>::from("export const button = 'primary';"),
+            ),
+            (
+                path("src/ui/button.test.tsx"),
+                Box::<str>::from("import { button } from './button';"),
+            ),
+        ]));
+
+        // The fixture has a source, component, and colocated test so later code can
+        // prove discovery and resolver behavior without reading from the host disk.
+        let paths = discovery::SourceDiscoverer::candidate_paths(&file_system).unwrap();
+
+        assert_eq!(
+            paths,
+            Box::<[roots::RootRelativePath]>::from([
+                path("src/accounts/service.ts"),
+                path("src/ui/button.test.tsx"),
+                path("src/ui/button.tsx"),
+            ]),
+        );
+        assert!(fs::FileExistence::exists(&file_system, &path("src/ui/button.tsx")).unwrap());
     }
 }
