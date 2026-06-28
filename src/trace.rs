@@ -1,8 +1,10 @@
 //! Concurrent reverse tracing contracts with shared in-flight path collapse.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+
+use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 
 use crate::failure;
 use crate::roots;
@@ -63,7 +65,7 @@ pub struct TraceResult {
 }
 
 /// Shortest reason chain produced by tracing.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct TraceReason {
     /// Starting node for the trace.
     pub start: roots::RootRelativePath,
@@ -74,7 +76,7 @@ pub struct TraceReason {
 }
 
 /// Deterministic representation of a cycle edge.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct CycleEdge {
     /// Source path in the cycle edge.
     pub from: roots::RootRelativePath,
@@ -113,6 +115,8 @@ pub enum TraceEvent {
     Reused(roots::RootRelativePath),
     /// A path completed with a deterministic result.
     Completed(roots::RootRelativePath),
+    /// A path failed before a deterministic result could be produced.
+    Failed(roots::RootRelativePath),
     /// A cycle edge was recorded without deadlocking.
     Cycle(CycleEdge),
 }
@@ -121,6 +125,8 @@ pub enum TraceEvent {
 #[derive(Clone, Debug, Default)]
 pub struct TraceMemo {
     statuses: Arc<Mutex<BTreeMap<roots::RootRelativePath, TraceStatus>>>,
+    wait_edges: Arc<Mutex<BTreeMap<roots::RootRelativePath, roots::RootRelativePath>>>,
+    completed: Arc<Condvar>,
 }
 
 impl TraceMemo {
@@ -152,20 +158,469 @@ pub struct Request<G, C, S> {
 /// # Errors
 ///
 /// Returns an error when tracing cannot produce deterministic results.
-pub fn changed_files<G, C, S>(_request: Request<G, C, S>) -> failure::Result<TraceResult>
+pub fn changed_files<G, C, S>(request: Request<G, C, S>) -> failure::Result<TraceResult>
 where
-    G: GraphView,
-    C: TestClassifier,
+    G: GraphView + Sync,
+    C: TestClassifier + Sync,
+    S: TraceProgressSink + Sync,
+{
+    let Request {
+        graph,
+        classifier,
+        progress,
+        memo,
+        scheduler,
+        changed_files,
+    } = request;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(scheduler.worker_count().get())
+        .build()
+        .map_err(|error| failure::AppError::Graph {
+            message: format!("trace worker pool failed: {error}").into_boxed_str(),
+        })?;
+    let context = TraceContext {
+        graph: &graph,
+        classifier: &classifier,
+        progress: &progress,
+        memo: &memo,
+    };
+    let roots = sorted_unique(changed_files.into_vec());
+    let results = pool.install(|| {
+        roots
+            .into_vec()
+            .into_par_iter()
+            .map(|path| {
+                trace_node(TraceNodeRequest {
+                    context: &context,
+                    path,
+                    ancestors: Box::from([]),
+                })
+            })
+            .collect::<failure::Result<Vec<TraceResult>>>()
+    })?;
+
+    Ok(merge_results(results))
+}
+
+struct TraceContext<'a, G, C, S> {
+    graph: &'a G,
+    classifier: &'a C,
+    progress: &'a S,
+    memo: &'a TraceMemo,
+}
+
+struct TraceNodeRequest<'a, 'context, G, C, S> {
+    context: &'context TraceContext<'a, G, C, S>,
+    path: roots::RootRelativePath,
+    ancestors: Box<[roots::RootRelativePath]>,
+}
+
+struct ComputeRequest<'a, 'context, G, C, S> {
+    context: &'context TraceContext<'a, G, C, S>,
+    path: roots::RootRelativePath,
+    ancestors: Box<[roots::RootRelativePath]>,
+}
+
+enum CompletedStatus {
+    Complete(TraceResult),
+    Failed(Box<str>),
+}
+
+struct WaitRequest<'a> {
+    memo: &'a TraceMemo,
+    waiter: Option<roots::RootRelativePath>,
+    path: roots::RootRelativePath,
+}
+
+struct CompletePathRequest<'a, S> {
+    memo: &'a TraceMemo,
+    progress: &'a S,
+    path: roots::RootRelativePath,
+    result: &'a failure::Result<TraceResult>,
+}
+
+struct RegisterWaitRequest<'a> {
+    memo: &'a TraceMemo,
+    waiter: Option<&'a roots::RootRelativePath>,
+    path: &'a roots::RootRelativePath,
+}
+
+struct WaitCycleRequest<'a> {
+    wait_edges: &'a BTreeMap<roots::RootRelativePath, roots::RootRelativePath>,
+    path: &'a roots::RootRelativePath,
+    waiter: &'a roots::RootRelativePath,
+}
+
+fn trace_node<G, C, S>(request: TraceNodeRequest<'_, '_, G, C, S>) -> failure::Result<TraceResult>
+where
+    G: GraphView + Sync,
+    C: TestClassifier + Sync,
+    S: TraceProgressSink + Sync,
+{
+    let TraceNodeRequest {
+        context,
+        path,
+        ancestors,
+    } = request;
+
+    if ancestors.contains(&path) {
+        let cycle_edge = cycle_from_ancestors(ancestors.as_ref(), &path);
+        context.progress.send(TraceEvent::Cycle(cycle_edge.clone()));
+        return Ok(TraceResult {
+            tests: Box::from([]),
+            reasons: Box::from([]),
+            cycle_edges: Box::from([cycle_edge]),
+        });
+    }
+
+    match claim_path(context.memo, &path)? {
+        TraceHandle::Completed(result) => {
+            context.progress.send(TraceEvent::Reused(path));
+            Ok(result)
+        }
+        TraceHandle::Waiting(waiting_path) => {
+            context
+                .progress
+                .send(TraceEvent::JoinedInFlight(waiting_path.clone()));
+            wait_for_path(WaitRequest {
+                memo: context.memo,
+                waiter: ancestors.last().cloned(),
+                path: waiting_path,
+            })
+        }
+        TraceHandle::Scheduled(scheduled_path) => {
+            context
+                .progress
+                .send(TraceEvent::Scheduled(scheduled_path.clone()));
+            let result = compute_node(ComputeRequest {
+                context,
+                path: scheduled_path.clone(),
+                ancestors,
+            });
+            complete_path(CompletePathRequest {
+                memo: context.memo,
+                progress: context.progress,
+                path: scheduled_path,
+                result: &result,
+            });
+            result
+        }
+    }
+}
+
+fn compute_node<G, C, S>(request: ComputeRequest<'_, '_, G, C, S>) -> failure::Result<TraceResult>
+where
+    G: GraphView + Sync,
+    C: TestClassifier + Sync,
+    S: TraceProgressSink + Sync,
+{
+    let ComputeRequest {
+        context,
+        path,
+        ancestors,
+    } = request;
+    let mut results = Vec::<TraceResult>::new();
+    let path_is_test = context.classifier.is_test(&path);
+    if path_is_test {
+        results.push(test_result(&path));
+    }
+
+    let child_ancestors = extend_ancestors(ancestors.as_ref(), &path);
+    for dependent in context.graph.reverse_dependents(&path) {
+        if ancestors.contains(dependent) {
+            let cycle_edge = CycleEdge {
+                from: path.clone(),
+                to: dependent.clone(),
+            };
+            context.progress.send(TraceEvent::Cycle(cycle_edge.clone()));
+            results.push(TraceResult {
+                tests: Box::from([]),
+                reasons: Box::from([]),
+                cycle_edges: Box::from([cycle_edge]),
+            });
+        } else {
+            let child_result = trace_node(TraceNodeRequest {
+                context,
+                path: dependent.clone(),
+                ancestors: child_ancestors.clone(),
+            })?;
+            results.push(prefix_result(&path, child_result));
+        }
+    }
+
+    Ok(merge_results(results))
+}
+
+fn claim_path(memo: &TraceMemo, path: &roots::RootRelativePath) -> failure::Result<TraceHandle> {
+    let mut statuses = memo
+        .statuses
+        .lock()
+        .map_err(|_error| failure::AppError::Graph {
+            message: Box::<str>::from("trace memo status lock poisoned"),
+        })?;
+
+    let handle = match statuses.get(path) {
+        Some(TraceStatus::Complete(result)) => Ok(TraceHandle::Completed(result.clone())),
+        Some(TraceStatus::Failed(message)) => Err(failure::AppError::Graph {
+            message: message.clone(),
+        }),
+        Some(TraceStatus::InFlight) => Ok(TraceHandle::Waiting(path.clone())),
+        Some(TraceStatus::Unseen) | None => {
+            statuses.insert(path.clone(), TraceStatus::InFlight);
+            Ok(TraceHandle::Scheduled(path.clone()))
+        }
+    };
+
+    drop(statuses);
+    handle
+}
+
+fn wait_for_path(request: WaitRequest<'_>) -> failure::Result<TraceResult> {
+    let WaitRequest { memo, waiter, path } = request;
+    if let Some(cycle_edge) = register_wait(&RegisterWaitRequest {
+        memo,
+        waiter: waiter.as_ref(),
+        path: &path,
+    })? {
+        return Ok(TraceResult {
+            tests: Box::from([]),
+            reasons: Box::from([]),
+            cycle_edges: Box::from([cycle_edge]),
+        });
+    }
+
+    let mut statuses = memo
+        .statuses
+        .lock()
+        .map_err(|_error| failure::AppError::Graph {
+            message: Box::<str>::from("trace memo status lock poisoned"),
+        })?;
+
+    loop {
+        match statuses.get(&path) {
+            Some(TraceStatus::Complete(result)) => {
+                remove_wait(memo, waiter.as_ref());
+                return Ok(result.clone());
+            }
+            Some(TraceStatus::Failed(message)) => {
+                remove_wait(memo, waiter.as_ref());
+                return Err(failure::AppError::Graph {
+                    message: message.clone(),
+                });
+            }
+            Some(TraceStatus::InFlight | TraceStatus::Unseen) | None => {
+                statuses =
+                    memo.completed
+                        .wait(statuses)
+                        .map_err(|_error| failure::AppError::Graph {
+                            message: Box::<str>::from("trace memo status lock poisoned"),
+                        })?;
+            }
+        }
+    }
+}
+
+fn complete_path<S>(request: CompletePathRequest<'_, S>)
+where
     S: TraceProgressSink,
 {
-    unimplemented!()
+    let CompletePathRequest {
+        memo,
+        progress,
+        path,
+        result,
+    } = request;
+    let completed_status = completed_status(result);
+    if let Ok(mut statuses) = memo.statuses.lock() {
+        let status = match completed_status {
+            CompletedStatus::Complete(trace_result) => TraceStatus::Complete(trace_result),
+            CompletedStatus::Failed(message) => TraceStatus::Failed(message),
+        };
+        statuses.insert(path.clone(), status);
+    }
+    remove_wait(memo, Some(&path));
+    memo.completed.notify_all();
+    match result {
+        Ok(_trace_result) => progress.send(TraceEvent::Completed(path)),
+        Err(_error) => progress.send(TraceEvent::Failed(path)),
+    }
+}
+
+fn register_wait(request: &RegisterWaitRequest<'_>) -> failure::Result<Option<CycleEdge>> {
+    let Some(waiter_path) = request.waiter else {
+        return Ok(None);
+    };
+    let mut wait_edges =
+        request
+            .memo
+            .wait_edges
+            .lock()
+            .map_err(|_error| failure::AppError::Graph {
+                message: Box::<str>::from("trace memo wait lock poisoned"),
+            })?;
+
+    if wait_cycle_exists(&WaitCycleRequest {
+        wait_edges: &wait_edges,
+        path: request.path,
+        waiter: waiter_path,
+    }) {
+        return Ok(Some(CycleEdge {
+            from: waiter_path.clone(),
+            to: request.path.clone(),
+        }));
+    }
+
+    wait_edges.insert(waiter_path.clone(), request.path.clone());
+    drop(wait_edges);
+    Ok(None)
+}
+
+fn wait_cycle_exists(request: &WaitCycleRequest<'_>) -> bool {
+    let mut current_path = request.path;
+    loop {
+        if current_path == request.waiter {
+            return true;
+        }
+        let Some(next_path) = request.wait_edges.get(current_path) else {
+            return false;
+        };
+        current_path = next_path;
+    }
+}
+
+fn remove_wait(memo: &TraceMemo, waiter: Option<&roots::RootRelativePath>) {
+    if let Some(waiter_path) = waiter
+        && let Ok(mut wait_edges) = memo.wait_edges.lock()
+    {
+        wait_edges.remove(waiter_path);
+    }
+}
+
+fn completed_status(result: &failure::Result<TraceResult>) -> CompletedStatus {
+    match result {
+        Ok(trace_result) => CompletedStatus::Complete(trace_result.clone()),
+        Err(error) => CompletedStatus::Failed(error.to_string().into_boxed_str()),
+    }
+}
+
+fn test_result(path: &roots::RootRelativePath) -> TraceResult {
+    TraceResult {
+        tests: Box::from([path.clone()]),
+        reasons: Box::from([TraceReason {
+            start: path.clone(),
+            test: path.clone(),
+            path: Box::from([path.clone()]),
+        }]),
+        cycle_edges: Box::from([]),
+    }
+}
+
+fn prefix_result(path: &roots::RootRelativePath, result: TraceResult) -> TraceResult {
+    let tests = result.tests.clone();
+    let reasons = result
+        .reasons
+        .into_vec()
+        .into_iter()
+        .map(|reason| prefix_reason(path, reason))
+        .collect::<Vec<TraceReason>>()
+        .into_boxed_slice();
+
+    TraceResult {
+        tests,
+        reasons,
+        cycle_edges: result.cycle_edges,
+    }
+}
+
+fn prefix_reason(path: &roots::RootRelativePath, reason: TraceReason) -> TraceReason {
+    let mut reason_path = Vec::<roots::RootRelativePath>::with_capacity(reason.path.len() + 1);
+    reason_path.push(path.clone());
+    reason_path.extend(reason.path.into_vec());
+
+    TraceReason {
+        start: path.clone(),
+        test: reason.test,
+        path: reason_path.into_boxed_slice(),
+    }
+}
+
+fn cycle_from_ancestors(
+    ancestors: &[roots::RootRelativePath],
+    path: &roots::RootRelativePath,
+) -> CycleEdge {
+    let from = ancestors.last().map_or_else(|| path.clone(), Clone::clone);
+
+    CycleEdge {
+        from,
+        to: path.clone(),
+    }
+}
+
+fn extend_ancestors(
+    ancestors: &[roots::RootRelativePath],
+    path: &roots::RootRelativePath,
+) -> Box<[roots::RootRelativePath]> {
+    let mut extended = Vec::<roots::RootRelativePath>::with_capacity(ancestors.len() + 1);
+    extended.extend_from_slice(ancestors);
+    extended.push(path.clone());
+    extended.into_boxed_slice()
+}
+
+fn merge_results(results: Vec<TraceResult>) -> TraceResult {
+    let mut tests = BTreeSet::<roots::RootRelativePath>::new();
+    let mut reasons = BTreeMap::<ReasonKey, TraceReason>::new();
+    let mut cycle_edges = BTreeSet::<CycleEdge>::new();
+
+    for result in results {
+        tests.extend(result.tests.into_vec());
+        for reason in result.reasons.into_vec() {
+            insert_shortest_reason(&mut reasons, reason);
+        }
+        cycle_edges.extend(result.cycle_edges.into_vec());
+    }
+
+    TraceResult {
+        tests: tests.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+        reasons: reasons.into_values().collect::<Vec<_>>().into_boxed_slice(),
+        cycle_edges: cycle_edges
+            .into_iter()
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ReasonKey {
+    start: roots::RootRelativePath,
+    test: roots::RootRelativePath,
+}
+
+fn insert_shortest_reason(reasons: &mut BTreeMap<ReasonKey, TraceReason>, reason: TraceReason) {
+    let key = ReasonKey {
+        start: reason.start.clone(),
+        test: reason.test.clone(),
+    };
+    let should_replace = reasons.get(&key).is_none_or(|existing| {
+        reason.path.len() < existing.path.len()
+            || (reason.path.len() == existing.path.len() && reason.path < existing.path)
+    });
+
+    if should_replace {
+        reasons.insert(key, reason);
+    }
+}
+
+fn sorted_unique(mut paths: Vec<roots::RootRelativePath>) -> Box<[roots::RootRelativePath]> {
+    paths.sort();
+    paths.dedup();
+    paths.into_boxed_slice()
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::num::NonZeroUsize;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Condvar, Mutex};
 
     use crate::roots;
 
@@ -181,6 +636,92 @@ mod tests {
                 .get(path)
                 .map_or_else(|| self.empty.as_ref(), Box::as_ref)
         }
+    }
+
+    #[derive(Clone, Debug)]
+    struct BlockingGraph {
+        reverse_edges: BTreeMap<roots::RootRelativePath, Box<[roots::RootRelativePath]>>,
+        empty: Box<[roots::RootRelativePath]>,
+        gate: JoinGate,
+        trace_counts: Arc<Mutex<BTreeMap<roots::RootRelativePath, usize>>>,
+    }
+
+    impl BlockingGraph {
+        fn count_for(&self, path: &roots::RootRelativePath) -> usize {
+            self.trace_counts
+                .lock()
+                .unwrap()
+                .get(path)
+                .copied()
+                .unwrap_or_default()
+        }
+    }
+
+    impl super::GraphView for BlockingGraph {
+        fn reverse_dependents(&self, path: &roots::RootRelativePath) -> &[roots::RootRelativePath] {
+            record_trace_count(&self.trace_counts, path);
+            self.gate.observe_graph_path(path);
+            self.reverse_edges
+                .get(path)
+                .map_or_else(|| self.empty.as_ref(), Box::as_ref)
+        }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct JoinGate {
+        state: Arc<(Mutex<JoinState>, Condvar)>,
+    }
+
+    impl JoinGate {
+        fn observe_graph_path(&self, path: &roots::RootRelativePath) {
+            if path.as_str() == "fileA" {
+                self.wait_for_shared_trace_to_start();
+            }
+            if path.as_str() == "fileB" {
+                self.mark_shared_trace_started();
+                self.wait_for_join();
+            }
+        }
+
+        fn mark_shared_trace_started(&self) {
+            let (state, completed) = self.state.as_ref();
+            let mut join_state = state.lock().unwrap();
+            join_state.shared_trace_started = true;
+            drop(join_state);
+            completed.notify_all();
+        }
+
+        fn wait_for_shared_trace_to_start(&self) {
+            let (state, completed) = self.state.as_ref();
+            let mut join_state = state.lock().unwrap();
+            while !join_state.shared_trace_started {
+                join_state = completed.wait(join_state).unwrap();
+            }
+            drop(join_state);
+        }
+
+        fn wait_for_join(&self) {
+            let (state, completed) = self.state.as_ref();
+            let mut join_state = state.lock().unwrap();
+            while !join_state.join_observed {
+                join_state = completed.wait(join_state).unwrap();
+            }
+            drop(join_state);
+        }
+
+        fn mark_join_observed(&self) {
+            let (state, completed) = self.state.as_ref();
+            let mut join_state = state.lock().unwrap();
+            join_state.join_observed = true;
+            drop(join_state);
+            completed.notify_all();
+        }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct JoinState {
+        shared_trace_started: bool,
+        join_observed: bool,
     }
 
     #[derive(Clone, Debug)]
@@ -201,6 +742,21 @@ mod tests {
 
     impl super::TraceProgressSink for RecordingSink {
         fn send(&self, event: super::TraceEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct JoinRecordingSink {
+        events: Arc<Mutex<Vec<super::TraceEvent>>>,
+        gate: JoinGate,
+    }
+
+    impl super::TraceProgressSink for JoinRecordingSink {
+        fn send(&self, event: super::TraceEvent) {
+            if event == super::TraceEvent::JoinedInFlight(path("fileB")) {
+                self.gate.mark_join_observed();
+            }
             self.events.lock().unwrap().push(event);
         }
     }
@@ -228,6 +784,28 @@ mod tests {
         }
     }
 
+    fn blocking_graph(
+        reverse_edges: BTreeMap<roots::RootRelativePath, Box<[roots::RootRelativePath]>>,
+        gate: JoinGate,
+    ) -> BlockingGraph {
+        BlockingGraph {
+            reverse_edges,
+            empty: Box::from([]),
+            gate,
+            trace_counts: Arc::default(),
+        }
+    }
+
+    fn record_trace_count(
+        trace_counts: &Arc<Mutex<BTreeMap<roots::RootRelativePath, usize>>>,
+        path: &roots::RootRelativePath,
+    ) {
+        let mut counts = trace_counts.lock().unwrap();
+        let count = counts.entry(path.clone()).or_default();
+        *count += 1;
+        drop(counts);
+    }
+
     fn trace(
         graph: FixtureGraph,
         changed_files: Box<[roots::RootRelativePath]>,
@@ -245,7 +823,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "not implemented")]
     fn starts_multiple_changed_files_in_parallel() {
         let graph = graph(BTreeMap::from([
             (path("fileB"), Box::from([path("tests/file-b.test.ts")])),
@@ -263,7 +840,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "not implemented")]
     fn reuses_completed_trace_results_when_a_later_path_reaches_the_same_node() {
         let memo = super::TraceMemo::default();
         let completed = super::TraceResult {
@@ -293,32 +869,42 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "not implemented")]
     fn joins_in_flight_trace_results_without_retracing_the_same_path() {
         let memo = super::TraceMemo::default();
-        memo.statuses()
-            .lock()
-            .unwrap()
-            .insert(path("fileB"), super::TraceStatus::InFlight);
+        let gate = JoinGate::default();
+        let events = Arc::new(Mutex::new(Vec::<super::TraceEvent>::new()));
+        let graph = blocking_graph(
+            BTreeMap::from([
+                (path("fileA"), Box::from([path("fileB")])),
+                (path("fileB"), Box::from([path("tests/file-b.test.ts")])),
+            ]),
+            gate.clone(),
+        );
         let request = super::Request {
-            graph: graph(BTreeMap::from([(
-                path("fileA"),
-                Box::from([path("fileB")]),
-            )])),
+            graph: graph.clone(),
             classifier: classifier(Box::from([path("tests/file-b.test.ts")])),
-            progress: RecordingSink::default(),
+            progress: JoinRecordingSink {
+                events: Arc::clone(&events),
+                gate,
+            },
             memo,
             scheduler: scheduler(),
-            changed_files: Box::from([path("fileA")]),
+            changed_files: Box::from([path("fileA"), path("fileB")]),
         };
 
         let result = super::changed_files(request).unwrap();
 
         assert_eq!(result.tests, Box::from([path("tests/file-b.test.ts")]));
+        assert_eq!(graph.count_for(&path("fileB")), 1);
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .contains(&super::TraceEvent::JoinedInFlight(path("fileB")))
+        );
     }
 
     #[test]
-    #[should_panic(expected = "not implemented")]
     fn collapses_file_b_overlap_while_independent_file_d_branch_continues() {
         let graph = graph(BTreeMap::from([
             (path("fileD"), Box::from([path("fileA"), path("fileC")])),
@@ -338,7 +924,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "not implemented")]
     fn cycles_complete_without_deadlock_or_duplicate_work() {
         let graph = graph(BTreeMap::from([
             (path("src/a.ts"), Box::from([path("src/b.ts")])),
