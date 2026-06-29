@@ -1,4 +1,4 @@
-//! Binary entry point for the affected-tests command-line interface.
+//! Binary entry point for the affected-tests-ts command-line interface.
 
 #![cfg_attr(not(test), deny(clippy::expect_used))]
 #![cfg_attr(not(test), deny(clippy::panic))]

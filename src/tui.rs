@@ -940,7 +940,7 @@ mod tests {
 
     fn layout() -> super::TuiLayout {
         super::TuiLayout {
-            header: panel("header", "affected-tests"),
+            header: panel("header", "affected-tests-ts"),
             phase_rail: panel("phases", "Phases"),
             trace_workspace: panel("active-traces", "Active Traces"),
             reuse_pane: panel("reuse", "Shared Work"),
@@ -1088,7 +1088,7 @@ mod tests {
         };
         let content = rendered_text(&frame);
 
-        assert!(content.contains("affected-tests"));
+        assert!(content.contains("affected-tests-ts"));
         assert!(content.contains("mode partial"));
         assert!(content.contains("base origin/main"));
         assert!(content.contains("head HEAD"));
@@ -1138,7 +1138,7 @@ mod tests {
         super::Terminal::draw_frame(&mut terminal, &frame).unwrap();
         let content = rendered_backend_text(&terminal);
 
-        assert!(content.contains("affected-tests"));
+        assert!(content.contains("affected-tests-ts"));
         assert!(content.contains("Active Traces"));
         assert!(content.contains("active src/file-d.ts"));
         assert!(content.contains("Shared Work"));

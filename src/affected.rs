@@ -195,6 +195,16 @@ where
         if change.status == vcs::ChangedFileStatus::Deleted && classifier.is_source(&change.path) {
             return Some(FullReason::DeletedSourceFile(change.path.clone()));
         }
+        if let Some(previous_path) = &change.previous_path {
+            if classifier.is_global_invalidator(previous_path) {
+                return Some(FullReason::GlobalInvalidator(previous_path.clone()));
+            }
+            if change.status == vcs::ChangedFileStatus::Renamed
+                && classifier.is_source(previous_path)
+            {
+                return Some(FullReason::DeletedSourceFile(previous_path.clone()));
+            }
+        }
     }
 
     None
@@ -226,8 +236,17 @@ where
     changes
         .files()
         .iter()
-        .map(|change| change.path.clone())
+        .flat_map(changed_trace_paths)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect()
+}
+
+fn changed_trace_paths(change: &vcs::ChangedFile) -> Box<[roots::RootRelativePath]> {
+    change.previous_path.as_ref().map_or_else(
+        || Box::from([change.path.clone()]),
+        |previous_path| Box::from([previous_path.clone(), change.path.clone()]),
+    )
 }
 
 fn decision_from_trace(
@@ -361,6 +380,14 @@ mod tests {
             status,
             path: path(value),
             previous_path: None,
+        }
+    }
+
+    fn renamed(previous_value: &str, current_value: &str) -> vcs::ChangedFile {
+        vcs::ChangedFile {
+            status: vcs::ChangedFileStatus::Renamed,
+            path: path(current_value),
+            previous_path: Some(path(previous_value)),
         }
     }
 
@@ -600,6 +627,54 @@ mod tests {
             super::AffectedResult::Partial(super::PartialDecision {
                 tests: Box::from([path("src/file-a.test.ts")]),
                 reasons: Box::from([]),
+            }),
+        );
+    }
+
+    #[test]
+    fn renamed_source_paths_fail_closed_for_old_path_without_base_graph() {
+        let result = super::select(request(Box::from([renamed(
+            "src/file-a.ts",
+            "src/file-renamed.ts",
+        )])))
+        .unwrap();
+
+        // Without a base graph, the selector cannot prove what depended on the
+        // old source path, so source renames conservatively run the full suite.
+        assert_eq!(
+            result,
+            super::AffectedResult::Full(super::FullReason::DeletedSourceFile(path(
+                "src/file-a.ts"
+            ))),
+        );
+    }
+
+    #[test]
+    fn renamed_test_paths_trace_old_and_new_names_when_not_source_like() {
+        let result = super::select(request(Box::from([renamed(
+            "src/file-a.test.ts",
+            "src/file-d.test.tsx",
+        )])))
+        .unwrap();
+
+        // Test renames are still safe to handle partially because both old and
+        // new test paths are themselves selected as direct changed tests.
+        assert_eq!(
+            result,
+            super::AffectedResult::Partial(super::PartialDecision {
+                tests: Box::from([path("src/file-a.test.ts"), path("src/file-d.test.tsx")]),
+                reasons: Box::from([
+                    super::SelectionReason {
+                        changed_file: path("src/file-a.test.ts"),
+                        test_file: path("src/file-a.test.ts"),
+                        path: Box::from([path("src/file-a.test.ts")]),
+                    },
+                    super::SelectionReason {
+                        changed_file: path("src/file-d.test.tsx"),
+                        test_file: path("src/file-d.test.tsx"),
+                        path: Box::from([path("src/file-d.test.tsx")]),
+                    },
+                ]),
             }),
         );
     }

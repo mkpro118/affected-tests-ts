@@ -7,6 +7,7 @@ use crate::failure;
 use crate::modules;
 use crate::parser;
 use crate::roots;
+use crate::settings;
 
 /// Metadata snapshot for a root-relative file.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -192,6 +193,12 @@ impl discovery::SourceDiscoverer for RealFileSystem {
 
 impl parser::SourceReader for RealFileSystem {
     fn source_text(&self, path: &roots::RootRelativePath) -> failure::Result<Box<str>> {
+        FileReader::read_text(self, path)
+    }
+}
+
+impl settings::LoaderFileSystem for RealFileSystem {
+    fn read_text(&self, path: &roots::RootRelativePath) -> failure::Result<Box<str>> {
         FileReader::read_text(self, path)
     }
 }

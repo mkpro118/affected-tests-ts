@@ -7,6 +7,9 @@
 #![cfg_attr(not(test), deny(unsafe_code))]
 
 pub mod app;
+pub(crate) mod app_contract;
+pub(crate) mod app_pipeline;
+pub(crate) mod app_render;
 pub mod cli;
 pub mod contract;
 #[path = "tui.rs"]

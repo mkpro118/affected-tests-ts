@@ -1,0 +1,7 @@
+{
+  "sourceIncludes": ["src/**/*.ts", "tests/**/*.ts"],
+  "excludes": [],
+  "testPatterns": ["tests/**/*.test.ts"],
+  "globalInvalidators": ["tsconfig.json"],
+  "dynamicImports": "failClosed"
+}
