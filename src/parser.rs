@@ -66,7 +66,9 @@ where
     let allocator = Allocator::default();
     let source_type = source_type_for_path(&path)?;
     let parser_return = Parser::new(&allocator, source.as_ref(), source_type).parse();
-    if parser_return.panicked || !parser_return.diagnostics.is_empty() {
+    if parser_return.panicked
+        || should_reject_diagnostics(source_type, !parser_return.diagnostics.is_empty())
+    {
         return Err(failure::AppError::Parse {
             message: format!("{:?}", parser_return.diagnostics).into_boxed_str(),
         });
@@ -79,6 +81,10 @@ fn source_type_for_path(path: &roots::RootRelativePath) -> failure::Result<Sourc
     SourceType::from_path(path.as_str()).map_err(|error| failure::AppError::Parse {
         message: format!("unsupported source path `{}`: {error}", path.as_str()).into_boxed_str(),
     })
+}
+
+fn should_reject_diagnostics(source_type: SourceType, has_diagnostics: bool) -> bool {
+    has_diagnostics && !source_type.is_typescript_definition()
 }
 
 fn collect_program_imports(program: &ast::Program<'_>) -> failure::Result<Imports> {
@@ -275,6 +281,16 @@ const loader = {
 const chunk = loader.import("./chunk");
 "#;
 
+    const AMBIENT_DECLARATION_SOURCE: &str = r#"
+import type { Account } from "./account";
+
+declare namespace Hipp {
+    declare interface Session {
+        account: Account;
+    }
+}
+"#;
+
     fn path(value: &str) -> roots::RootRelativePath {
         roots::RootRelativePath::try_from(value).unwrap()
     }
@@ -379,5 +395,24 @@ const chunk = loader.import("./chunk");
             Box::<[roots::ImportSpecifier]>::from([])
         );
         assert_eq!(imports.unsupported_dynamic_imports, Box::from([]));
+    }
+
+    #[test]
+    fn declaration_file_diagnostics_do_not_hide_recoverable_imports() {
+        let request = super::Request {
+            reader: FixtureReader {
+                source: AMBIENT_DECLARATION_SOURCE,
+            },
+            path: path("src/types/session.d.ts"),
+        };
+
+        // Large declaration files can contain ambient forms Oxc diagnoses while
+        // still producing an AST with the imports needed for graph edges.
+        let imports = super::imports(request).unwrap();
+
+        assert_eq!(
+            imports.static_specifiers,
+            Box::<[roots::ImportSpecifier]>::from([specifier("./account")]),
+        );
     }
 }
