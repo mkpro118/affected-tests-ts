@@ -41,6 +41,45 @@ pub enum Format {
     Plain,
 }
 
+/// Standard-output interactivity used for automatic human output selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamInteractivity {
+    /// Standard output is connected to an interactive terminal.
+    Interactive,
+    /// Standard output is redirected, piped, or captured by CI.
+    NonInteractive,
+}
+
+/// User-requested output format before automatic TTY selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FormatRequest {
+    /// No explicit format was requested, so choose human output for the stream.
+    Auto,
+    /// The user or command selected an exact output format.
+    Explicit(Format),
+}
+
+/// Request object for output-format selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SelectionRequest {
+    /// Requested output mode from CLI parsing or command defaults.
+    pub requested: FormatRequest,
+    /// Current stdout interactivity.
+    pub stdout: StreamInteractivity,
+}
+
+/// Selects the concrete renderer without producing command output.
+#[must_use]
+pub const fn select_format(request: SelectionRequest) -> Format {
+    match request.requested {
+        FormatRequest::Explicit(format) => format,
+        FormatRequest::Auto => match request.stdout {
+            StreamInteractivity::Interactive => Format::Tui,
+            StreamInteractivity::NonInteractive => Format::Docker,
+        },
+    }
+}
+
 /// Result renderer capability used by output orchestration.
 pub trait ResultRenderer {
     /// Writes rendered text.
@@ -278,5 +317,30 @@ mod tests {
         assert_eq!(shell_output_for(full_result), "");
         assert_eq!(shell_output_for(none_result), "");
         assert_eq!(shell_output_for(error_result), "");
+    }
+
+    #[test]
+    fn auto_output_selects_tui_only_for_interactive_human_streams() {
+        assert_eq!(
+            super::select_format(super::SelectionRequest {
+                requested: super::FormatRequest::Auto,
+                stdout: super::StreamInteractivity::Interactive,
+            }),
+            super::Format::Tui
+        );
+        assert_eq!(
+            super::select_format(super::SelectionRequest {
+                requested: super::FormatRequest::Auto,
+                stdout: super::StreamInteractivity::NonInteractive,
+            }),
+            super::Format::Docker
+        );
+        assert_eq!(
+            super::select_format(super::SelectionRequest {
+                requested: super::FormatRequest::Explicit(super::Format::Json),
+                stdout: super::StreamInteractivity::Interactive,
+            }),
+            super::Format::Json
+        );
     }
 }
