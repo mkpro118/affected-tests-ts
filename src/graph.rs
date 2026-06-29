@@ -53,13 +53,13 @@ pub struct LocalImports<C, R, M, P> {
     reader: R,
     resolver: M,
     probe: P,
-    dynamic_import_mode: DynamicImportMode,
+    failure_mode: ImportFailureMode,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DynamicImportMode {
-    Configured,
-    IgnoreUnsupported,
+enum ImportFailureMode {
+    Strict,
+    GraphOutput,
 }
 
 impl<C, R, M, P> LocalImports<C, R, M, P> {
@@ -71,7 +71,7 @@ impl<C, R, M, P> LocalImports<C, R, M, P> {
             reader: request.reader,
             resolver: request.resolver,
             probe: request.probe,
-            dynamic_import_mode: DynamicImportMode::Configured,
+            failure_mode: ImportFailureMode::Strict,
         }
     }
 
@@ -83,7 +83,7 @@ impl<C, R, M, P> LocalImports<C, R, M, P> {
             reader: request.reader,
             resolver: request.resolver,
             probe: request.probe,
-            dynamic_import_mode: DynamicImportMode::IgnoreUnsupported,
+            failure_mode: ImportFailureMode::GraphOutput,
         }
     }
 }
@@ -106,7 +106,7 @@ where
 
         if should_fail_for_dynamic_imports(&DynamicImportFailureRequest {
             config: &self.config,
-            mode: self.dynamic_import_mode,
+            mode: self.failure_mode,
             unsupported_count: imports.unsupported_dynamic_imports.len(),
         }) {
             return Err(failure::AppError::UnknownDynamicImport {
@@ -121,6 +121,7 @@ where
             importer: path.clone(),
             static_specifiers: imports.static_specifiers,
             dynamic_specifiers: imports.dynamic_specifiers,
+            failure_mode: self.failure_mode,
         })
     }
 }
@@ -181,6 +182,7 @@ struct ResolveImportsRequest<C, M, P> {
     importer: roots::RootRelativePath,
     static_specifiers: Box<[roots::ImportSpecifier]>,
     dynamic_specifiers: Box<[roots::ImportSpecifier]>,
+    failure_mode: ImportFailureMode,
 }
 
 struct NodeEdges {
@@ -190,7 +192,7 @@ struct NodeEdges {
 
 struct DynamicImportFailureRequest<'a, C> {
     config: &'a C,
-    mode: DynamicImportMode,
+    mode: ImportFailureMode,
     unsupported_count: usize,
 }
 
@@ -198,7 +200,7 @@ fn should_fail_for_dynamic_imports<C>(request: &DynamicImportFailureRequest<'_, 
 where
     C: settings::View,
 {
-    request.mode == DynamicImportMode::Configured
+    request.mode == ImportFailureMode::Strict
         && request.unsupported_count > 0
         && request.config.dynamic_imports() == settings::UnknownDynamicImportBehavior::FailClosed
 }
@@ -218,6 +220,7 @@ where
         importer,
         static_specifiers,
         dynamic_specifiers,
+        failure_mode,
     } = request;
     let mut dependencies = Vec::<roots::RootRelativePath>::new();
     for specifier in static_specifiers
@@ -236,10 +239,12 @@ where
             modules::Outcome::Resolved(path) => dependencies.push(path),
             modules::Outcome::External(_specifier) => {}
             modules::Outcome::Unresolved(specifier) => {
-                return Err(failure::AppError::UnresolvedLocalImport {
-                    importer,
-                    specifier,
-                });
+                if failure_mode == ImportFailureMode::Strict {
+                    return Err(failure::AppError::UnresolvedLocalImport {
+                        importer,
+                        specifier,
+                    });
+                }
             }
         }
     }
@@ -460,7 +465,9 @@ mod tests {
         let file_system = vfs::VirtualFileSystem::with_files(Box::from([
             (
                 path("src/router.ts"),
-                Box::<str>::from("import './routes';\nconst page = import(routeName);"),
+                Box::<str>::from(
+                    "import './routes';\nimport './missing';\nconst page = import(routeName);",
+                ),
             ),
             (
                 path("src/routes.ts"),
@@ -477,7 +484,7 @@ mod tests {
         });
 
         // Graph inspection should remain useful even when selection will fail
-        // closed for an unsupported dynamic import in the same file.
+        // closed for unsupported dynamic or unresolved local imports.
         let dependencies =
             super::ImportResolver::dependencies_for(&imports, &path("src/router.ts")).unwrap();
 
