@@ -1,6 +1,9 @@
 //! Import resolution contracts for relative paths, extensions, index files, and aliases.
 
 use std::cmp;
+use std::path;
+
+use globset::Glob;
 
 use crate::failure;
 use crate::roots;
@@ -72,8 +75,18 @@ where
 
     match candidate_bases {
         CandidateBases::External => Ok(Outcome::External(request.specifier)),
-        CandidateBases::Local(paths) => resolve_local_paths(&request.probe, paths.as_ref())
-            .map(|outcome| outcome.unwrap_or(Outcome::Unresolved(request.specifier))),
+        CandidateBases::Local(paths) => {
+            let outcome = resolve_local_paths(&request.probe, paths.as_ref())?;
+            Ok(outcome.unwrap_or_else(|| {
+                if all_candidates_are_excluded(&request.config, paths.as_ref())
+                    || all_candidates_are_generated(paths.as_ref())
+                {
+                    Outcome::External(request.specifier)
+                } else {
+                    Outcome::Unresolved(request.specifier)
+                }
+            }))
+        }
         CandidateBases::MaybeLocal(paths) => resolve_local_paths(&request.probe, paths.as_ref())
             .map(|outcome| outcome.unwrap_or(Outcome::External(request.specifier))),
     }
@@ -115,9 +128,15 @@ where
             || CandidateBases::External,
             |candidate| CandidateBases::MaybeLocal(Box::from([candidate])),
         )
+    } else if specifier_can_fallback_to_external(specifier) {
+        CandidateBases::MaybeLocal(mapped_candidates.into_boxed_slice())
     } else {
         CandidateBases::Local(mapped_candidates.into_boxed_slice())
     }
+}
+
+fn specifier_can_fallback_to_external(specifier: &str) -> bool {
+    !specifier.starts_with("@/") && !specifier.starts_with("src/") && !specifier.starts_with("~/")
 }
 
 fn base_url_candidate<C>(config: &C, specifier: &str) -> Option<Box<str>>
@@ -278,6 +297,39 @@ where
     Ok(None)
 }
 
+fn all_candidates_are_excluded<C>(config: &C, candidate_bases: &[Box<str>]) -> bool
+where
+    C: settings::View,
+{
+    !candidate_bases.is_empty()
+        && candidate_bases
+            .iter()
+            .all(|candidate| path_matches_any_pattern(candidate.as_ref(), config.excludes()))
+}
+
+fn all_candidates_are_generated(candidate_bases: &[Box<str>]) -> bool {
+    !candidate_bases.is_empty()
+        && candidate_bases
+            .iter()
+            .all(|candidate| candidate_is_generated(candidate.as_ref()))
+}
+
+fn candidate_is_generated(candidate: &str) -> bool {
+    candidate == "generated"
+        || candidate.starts_with("generated/")
+        || candidate.contains("/generated/")
+}
+
+fn path_matches_any_pattern(path: &str, patterns: &[settings::Pattern]) -> bool {
+    patterns
+        .iter()
+        .any(|pattern| path_matches_pattern(path, pattern.as_str()))
+}
+
+fn path_matches_pattern(path: &str, pattern: &str) -> bool {
+    Glob::new(pattern).is_ok_and(|glob| glob.compile_matcher().is_match(path))
+}
+
 fn resolve_candidate<P>(
     probe: &P,
     candidate_base: &str,
@@ -286,7 +338,10 @@ where
     P: FileExistence,
 {
     for candidate_path in candidate_paths(candidate_base) {
-        let path = roots::RootRelativePath::try_from(candidate_path)?;
+        let Some(normalized_candidate) = normalize_candidate_path(candidate_path.as_ref()) else {
+            continue;
+        };
+        let path = roots::RootRelativePath::try_from(normalized_candidate)?;
         if probe.exists(&path)? {
             return Ok(Some(path));
         }
@@ -317,6 +372,33 @@ fn candidate_paths(candidate_base: &str) -> Box<[Box<str>]> {
     );
 
     paths.into_boxed_slice()
+}
+
+fn normalize_candidate_path(candidate_path: &str) -> Option<Box<str>> {
+    if candidate_path.is_empty() || candidate_path.contains('\\') {
+        return None;
+    }
+
+    let mut segments = Vec::<Box<str>>::new();
+    for component in path::Path::new(candidate_path).components() {
+        match component {
+            path::Component::Normal(segment) => {
+                let segment_text = segment.to_str()?;
+                segments.push(Box::<str>::from(segment_text));
+            }
+            path::Component::CurDir => {}
+            path::Component::ParentDir => {
+                segments.pop()?;
+            }
+            path::Component::RootDir | path::Component::Prefix(_) => return None,
+        }
+    }
+
+    if segments.is_empty() {
+        None
+    } else {
+        Some(join_segments(segments.as_ref()).into_boxed_str())
+    }
 }
 
 fn join_segments(segments: &[Box<str>]) -> String {
@@ -434,6 +516,51 @@ mod tests {
         }
     }
 
+    fn config_with_root_alias() -> FixtureConfig {
+        FixtureConfig {
+            path_mappings: Box::from([settings::PathMapping::try_new(
+                "@/*",
+                Box::from([Box::<str>::from("src/*")]),
+            )
+            .unwrap()]),
+            ..FixtureConfig::default()
+        }
+    }
+
+    fn config_with_package_mapping() -> FixtureConfig {
+        FixtureConfig {
+            path_mappings: Box::from([settings::PathMapping::try_new(
+                "type-graphql",
+                Box::from([Box::<str>::from("src/index.ts")]),
+            )
+            .unwrap()]),
+            ..FixtureConfig::default()
+        }
+    }
+
+    fn config_with_excluded_generated_alias() -> FixtureConfig {
+        FixtureConfig {
+            excludes: Box::from([settings::Pattern::try_from("src/generated/**").unwrap()]),
+            path_mappings: Box::from([settings::PathMapping::try_new(
+                "@/*",
+                Box::from([Box::<str>::from("src/*")]),
+            )
+            .unwrap()]),
+            ..FixtureConfig::default()
+        }
+    }
+
+    fn config_with_generated_alias() -> FixtureConfig {
+        FixtureConfig {
+            path_mappings: Box::from([settings::PathMapping::try_new(
+                "@/*",
+                Box::from([Box::<str>::from("src/*")]),
+            )
+            .unwrap()]),
+            ..FixtureConfig::default()
+        }
+    }
+
     #[test]
     fn resolves_relative_extensions_indexes_and_ts_path_aliases() {
         let probe = FixtureProbe {
@@ -541,6 +668,110 @@ mod tests {
         assert_eq!(
             super::import(request).unwrap(),
             super::Outcome::Resolved(path("src/config/explicit.ts")),
+        );
+    }
+
+    #[test]
+    fn path_mapping_candidates_normalize_parent_segments_inside_root() {
+        let probe = FixtureProbe {
+            existing_paths: BTreeSet::from([path("testing-library.ts")]),
+        };
+        let resolved_request = super::ResolveRequest {
+            config: config_with_root_alias(),
+            probe: probe.clone(),
+            importer: path("src/app/example.test.ts"),
+            specifier: specifier("@/../testing-library"),
+        };
+        let escaped_request = super::ResolveRequest {
+            config: config_with_root_alias(),
+            probe,
+            importer: path("src/app/example.test.ts"),
+            specifier: specifier("@/../../outside"),
+        };
+
+        // TS path mappings can produce lexical parent segments that still point
+        // inside the workspace; candidates escaping the root remain unresolved.
+        assert_eq!(
+            super::import(resolved_request).unwrap(),
+            super::Outcome::Resolved(path("testing-library.ts")),
+        );
+        assert_eq!(
+            super::import(escaped_request).unwrap(),
+            super::Outcome::Unresolved(specifier("@/../../outside")),
+        );
+    }
+
+    #[test]
+    fn missing_excluded_generated_aliases_are_external_to_the_graph() {
+        let generated_request = super::ResolveRequest {
+            config: config_with_excluded_generated_alias(),
+            probe: FixtureProbe {
+                existing_paths: BTreeSet::new(),
+            },
+            importer: path("src/pages/api.ts"),
+            specifier: specifier("@/generated/client/enums"),
+        };
+        let generated_without_exclude_request = super::ResolveRequest {
+            config: config_with_generated_alias(),
+            probe: FixtureProbe {
+                existing_paths: BTreeSet::new(),
+            },
+            importer: path("src/pages/api.ts"),
+            specifier: specifier("@/generated/client/runtime"),
+        };
+        let missing_source_request = super::ResolveRequest {
+            config: config_with_root_alias(),
+            probe: FixtureProbe {
+                existing_paths: BTreeSet::new(),
+            },
+            importer: path("src/pages/api.ts"),
+            specifier: specifier("@/features/missing"),
+        };
+
+        // Generated outputs outside the source graph should not force a
+        // full run, while ordinary missing source aliases remain fail-closed.
+        assert_eq!(
+            super::import(generated_request).unwrap(),
+            super::Outcome::External(specifier("@/generated/client/enums")),
+        );
+        assert_eq!(
+            super::import(generated_without_exclude_request).unwrap(),
+            super::Outcome::External(specifier("@/generated/client/runtime")),
+        );
+        assert_eq!(
+            super::import(missing_source_request).unwrap(),
+            super::Outcome::Unresolved(specifier("@/features/missing")),
+        );
+    }
+
+    #[test]
+    fn missing_package_path_mappings_fall_back_to_external_packages() {
+        let package_request = super::ResolveRequest {
+            config: config_with_package_mapping(),
+            probe: FixtureProbe {
+                existing_paths: BTreeSet::new(),
+            },
+            importer: path("src/pages/api.ts"),
+            specifier: specifier("type-graphql"),
+        };
+        let alias_request = super::ResolveRequest {
+            config: config_with_root_alias(),
+            probe: FixtureProbe {
+                existing_paths: BTreeSet::new(),
+            },
+            importer: path("src/pages/api.ts"),
+            specifier: specifier("@/missing"),
+        };
+
+        // Package path mappings may be local shims when present, but can safely
+        // fall back to external packages when absent; app aliases stay local.
+        assert_eq!(
+            super::import(package_request).unwrap(),
+            super::Outcome::External(specifier("type-graphql")),
+        );
+        assert_eq!(
+            super::import(alias_request).unwrap(),
+            super::Outcome::Unresolved(specifier("@/missing")),
         );
     }
 }
