@@ -35,6 +35,7 @@ pub mod progress;
 pub mod roots;
 #[path = "config.rs"]
 pub mod settings;
+mod static_refs;
 #[path = "git.rs"]
 pub mod vcs;
 #[path = "trace.rs"]

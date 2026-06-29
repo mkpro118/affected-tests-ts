@@ -2,12 +2,13 @@
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast;
-use oxc_ast_visit::{Visit, walk};
+use oxc_ast_visit::{walk, Visit};
 use oxc_parser::Parser;
 use oxc_span::SourceType;
 
 use crate::failure;
 use crate::roots;
+use crate::static_refs;
 
 /// File content capability consumed by parser input loading.
 pub trait SourceReader {
@@ -94,7 +95,8 @@ fn collect_program_imports(program: &ast::Program<'_>) -> failure::Result<Import
         collect_static_statement_imports(statement, &mut static_specifiers)?;
     }
 
-    let mut dynamic_collector = DynamicImportCollector::default();
+    let resolver = static_refs::Resolver::from_program(program);
+    let mut dynamic_collector = DynamicImportCollector::new(resolver);
     dynamic_collector.visit_program(program);
     if let Some(error) = dynamic_collector.error {
         return Err(error);
@@ -168,11 +170,22 @@ fn push_specifier(
     Ok(())
 }
 
-#[derive(Default)]
 struct DynamicImportCollector {
+    resolver: static_refs::Resolver,
     dynamic_specifiers: Vec<roots::ImportSpecifier>,
     unsupported_dynamic_imports: Vec<UnsupportedDynamicImport>,
     error: Option<failure::AppError>,
+}
+
+impl DynamicImportCollector {
+    const fn new(resolver: static_refs::Resolver) -> Self {
+        Self {
+            resolver,
+            dynamic_specifiers: Vec::new(),
+            unsupported_dynamic_imports: Vec::new(),
+            error: None,
+        }
+    }
 }
 
 impl<'a> Visit<'a> for DynamicImportCollector {
@@ -181,55 +194,17 @@ impl<'a> Visit<'a> for DynamicImportCollector {
             return;
         }
 
-        match &import_expression.source {
-            ast::Expression::StringLiteral(literal) => {
-                match roots::ImportSpecifier::try_from(literal.value.as_str()) {
+        match self
+            .resolver
+            .dynamic_import_specifier(&import_expression.source)
+        {
+            Some(specifier_value) => {
+                match roots::ImportSpecifier::try_from(specifier_value.as_ref()) {
                     Ok(specifier) => self.dynamic_specifiers.push(specifier),
                     Err(error) => self.error = Some(error),
                 }
             }
-            ast::Expression::BooleanLiteral(_)
-            | ast::Expression::NullLiteral(_)
-            | ast::Expression::NumericLiteral(_)
-            | ast::Expression::BigIntLiteral(_)
-            | ast::Expression::RegExpLiteral(_)
-            | ast::Expression::TemplateLiteral(_)
-            | ast::Expression::Identifier(_)
-            | ast::Expression::MetaProperty(_)
-            | ast::Expression::Super(_)
-            | ast::Expression::ArrayExpression(_)
-            | ast::Expression::ArrowFunctionExpression(_)
-            | ast::Expression::AssignmentExpression(_)
-            | ast::Expression::AwaitExpression(_)
-            | ast::Expression::BinaryExpression(_)
-            | ast::Expression::CallExpression(_)
-            | ast::Expression::ChainExpression(_)
-            | ast::Expression::ClassExpression(_)
-            | ast::Expression::ConditionalExpression(_)
-            | ast::Expression::FunctionExpression(_)
-            | ast::Expression::ImportExpression(_)
-            | ast::Expression::LogicalExpression(_)
-            | ast::Expression::NewExpression(_)
-            | ast::Expression::ObjectExpression(_)
-            | ast::Expression::ParenthesizedExpression(_)
-            | ast::Expression::SequenceExpression(_)
-            | ast::Expression::TaggedTemplateExpression(_)
-            | ast::Expression::ThisExpression(_)
-            | ast::Expression::UnaryExpression(_)
-            | ast::Expression::UpdateExpression(_)
-            | ast::Expression::YieldExpression(_)
-            | ast::Expression::PrivateInExpression(_)
-            | ast::Expression::JSXElement(_)
-            | ast::Expression::JSXFragment(_)
-            | ast::Expression::TSAsExpression(_)
-            | ast::Expression::TSSatisfiesExpression(_)
-            | ast::Expression::TSTypeAssertion(_)
-            | ast::Expression::TSNonNullExpression(_)
-            | ast::Expression::TSInstantiationExpression(_)
-            | ast::Expression::ComputedMemberExpression(_)
-            | ast::Expression::StaticMemberExpression(_)
-            | ast::Expression::PrivateFieldExpression(_)
-            | ast::Expression::V8IntrinsicExpression(_) => {
+            None => {
                 self.unsupported_dynamic_imports
                     .push(UnsupportedDynamicImport {
                         kind: UnsupportedDynamicImportKind::NonLiteral,
@@ -238,6 +213,87 @@ impl<'a> Visit<'a> for DynamicImportCollector {
         }
 
         walk::walk_import_expression(self, import_expression);
+    }
+
+    fn visit_function(
+        &mut self,
+        function: &ast::Function<'a>,
+        flags: oxc_syntax::scope::ScopeFlags,
+    ) {
+        let scope = self.resolver.scope_for_function(function);
+        self.resolver.push_scope(scope);
+        walk::walk_function(self, function, flags);
+        self.resolver.pop_scope();
+    }
+
+    fn visit_arrow_function_expression(&mut self, function: &ast::ArrowFunctionExpression<'a>) {
+        let scope = self.resolver.scope_for_parameters(&function.params);
+        self.resolver.push_scope(scope);
+        walk::walk_arrow_function_expression(self, function);
+        self.resolver.pop_scope();
+    }
+
+    fn visit_function_body(&mut self, body: &ast::FunctionBody<'a>) {
+        let scope = self.resolver.scope_for_function_body(body);
+        self.resolver.push_scope(scope);
+        walk::walk_function_body(self, body);
+        self.resolver.pop_scope();
+    }
+
+    fn visit_block_statement(&mut self, block: &ast::BlockStatement<'a>) {
+        let scope = self.resolver.scope_for_block(block);
+        self.resolver.push_scope(scope);
+        walk::walk_block_statement(self, block);
+        self.resolver.pop_scope();
+    }
+
+    fn visit_switch_statement(&mut self, switch_statement: &ast::SwitchStatement<'a>) {
+        let scope = self.resolver.scope_for_switch_statement(switch_statement);
+        self.resolver.push_scope(scope);
+        walk::walk_switch_statement(self, switch_statement);
+        self.resolver.pop_scope();
+    }
+
+    fn visit_switch_case(&mut self, switch_case: &ast::SwitchCase<'a>) {
+        let scope = self.resolver.scope_for_switch_case(switch_case);
+        self.resolver.push_scope(scope);
+        walk::walk_switch_case(self, switch_case);
+        self.resolver.pop_scope();
+    }
+
+    fn visit_catch_clause(&mut self, catch_clause: &ast::CatchClause<'a>) {
+        let scope = self.resolver.scope_for_catch_clause(catch_clause);
+        self.resolver.push_scope(scope);
+        walk::walk_catch_clause(self, catch_clause);
+        self.resolver.pop_scope();
+    }
+
+    fn visit_for_statement(&mut self, statement: &ast::ForStatement<'a>) {
+        let scope = self.resolver.scope_for_for_statement(statement);
+        self.resolver.push_scope(scope);
+        walk::walk_for_statement(self, statement);
+        self.resolver.pop_scope();
+    }
+
+    fn visit_for_in_statement(&mut self, statement: &ast::ForInStatement<'a>) {
+        let scope = self.resolver.scope_for_for_in_statement(statement);
+        self.resolver.push_scope(scope);
+        walk::walk_for_in_statement(self, statement);
+        self.resolver.pop_scope();
+    }
+
+    fn visit_for_of_statement(&mut self, statement: &ast::ForOfStatement<'a>) {
+        let scope = self.resolver.scope_for_for_of_statement(statement);
+        self.resolver.push_scope(scope);
+        walk::walk_for_of_statement(self, statement);
+        self.resolver.pop_scope();
+    }
+
+    fn visit_class(&mut self, class: &ast::Class<'a>) {
+        let scope = self.resolver.scope_for_class(class);
+        self.resolver.push_scope(scope);
+        walk::walk_class(self, class);
+        self.resolver.pop_scope();
     }
 }
 
@@ -267,6 +323,169 @@ const lazyPanel = import('./lazy-panel');
 
     const NON_LITERAL_DYNAMIC_IMPORT_SOURCE: &str = "const page = import(routeName);";
 
+    const CACHE_BUSTED_CONST_DYNAMIC_IMPORT_SOURCE: &str = r#"
+import { resolve } from "node:path";
+
+const SUT = "src/utils/date";
+const REHYDRATE_SUT = "../actions" as const;
+const ASSERTED_SUT = <const>"../authReport";
+const PATH_RESOLVED_SUT = resolve(import.meta.dir, "../dag-resolver");
+const MODULE_PATH = "@/app/(dashboard)/billing/manual-eob/helpers" as const;
+const bustCache = () => `${MODULE_PATH}?update=${Date.now()}`;
+
+async function loadModules() {
+    await import(`${SUT}?ts=${Date.now()}`);
+    await import(`${REHYDRATE_SUT}?ts=${Date.now()}-${Math.random()}`);
+    await import(`${ASSERTED_SUT}?ts=${Date.now()}`);
+    await import(`${PATH_RESOLVED_SUT}?ts=${Date.now()}`);
+    await import(bustCache());
+}
+"#;
+
+    const CACHE_BUSTED_DIRECT_TEMPLATE_IMPORT_SOURCE: &str = r"
+async function loadMetrics() {
+    await import(`../dashboard/KPIMetricsCards?ts=${Date.now()}`);
+}
+";
+
+    const CACHE_BUSTED_STRING_LITERAL_IMPORT_SOURCE: &str =
+        "const lazyPanel = import('./lazy-panel?ts=123');";
+
+    const CONST_IDENTIFIER_DYNAMIC_IMPORT_SOURCE: &str = r#"
+const PROVIDER_SUT = "src/app/sidebarPrimitives";
+
+async function loadProvider() {
+    await import(PROVIDER_SUT);
+}
+"#;
+
+    const NESTED_CALLBACK_CONST_DYNAMIC_IMPORT_SOURCE: &str = r#"
+describe("feature", () => {
+    const SYSTEM_UNDER_TEST = "../utils";
+
+    beforeAll(async () => {
+        await import(`${SYSTEM_UNDER_TEST}?ts=${Date.now()}`);
+    });
+});
+"#;
+
+    const PARAMETER_SHADOWED_SUT_DYNAMIC_IMPORT_SOURCE: &str = r#"
+const SUT = "../safe";
+
+async function load(SUT: string) {
+    await import(`${SUT}?ts=${Date.now()}`);
+}
+"#;
+
+    const LOCAL_SHADOWED_SUT_DYNAMIC_IMPORT_SOURCE: &str = r#"
+const SUT = "../safe";
+
+async function load() {
+    const SUT = getRuntimePath();
+    await import(`${SUT}?ts=${Date.now()}`);
+}
+"#;
+
+    const LOOP_SHADOWED_SUT_DYNAMIC_IMPORT_SOURCE: &str = r#"
+const SUT = "../safe";
+
+async function load(paths: string[], pathMap: Record<string, string>) {
+    for (const SUT = nextPath(); shouldLoad(SUT); advance()) {
+        await import(`${SUT}?ts=${Date.now()}`);
+    }
+    for (const SUT in pathMap) {
+        await import(`${SUT}?ts=${Date.now()}`);
+    }
+    for (const SUT of paths) {
+        await import(`${SUT}?ts=${Date.now()}`);
+    }
+}
+"#;
+
+    const TOP_LEVEL_LOOP_SHADOWED_SUT_DYNAMIC_IMPORT_SOURCE: &str = r#"
+const SUT = "../safe";
+declare const paths: string[];
+
+for (const SUT of paths) {
+    import(`${SUT}?ts=${Date.now()}`);
+}
+"#;
+
+    const CONTROL_FLOW_LOOP_SHADOWED_SUT_DYNAMIC_IMPORT_SOURCE: &str = r#"
+const SUT = "../safe";
+
+async function load(paths: string[], shouldLoad: boolean) {
+    if (shouldLoad)
+        for (const SUT of paths)
+            await import(`${SUT}?ts=${Date.now()}`);
+}
+"#;
+
+    const CATCH_PARAMETER_SHADOWED_SUT_DYNAMIC_IMPORT_SOURCE: &str = r#"
+const SUT = "../safe";
+
+async function load() {
+    try {
+        await prepare();
+    } catch (SUT) {
+        await import(`${SUT}?ts=${Date.now()}`);
+    }
+}
+"#;
+
+    const SWITCH_CASE_SHADOWED_SUT_DYNAMIC_IMPORT_SOURCE: &str = r#"
+const SUT = "../safe";
+
+async function load(kind: string) {
+    switch (kind) {
+        case "runtime":
+            const SUT = getRuntimePath();
+            await import(`${SUT}?ts=${Date.now()}`);
+            break;
+    }
+}
+"#;
+
+    const SWITCH_SIBLING_CASE_SHADOWED_SUT_DYNAMIC_IMPORT_SOURCE: &str = r#"
+const SUT = "../safe";
+
+async function load(kind: string) {
+    switch (kind) {
+        case "a": {
+            const SUT = runtimePath();
+            break;
+        }
+        case "b": {
+            await import(`${SUT}?ts=${Date.now()}`);
+            break;
+        }
+    }
+}
+"#;
+
+    const NAMED_FUNCTION_EXPRESSION_SHADOWED_SUT_DYNAMIC_IMPORT_SOURCE: &str = r#"
+const SUT = "../safe";
+
+const load = async function SUT() {
+    await import(`${SUT}?ts=${Date.now()}`);
+};
+"#;
+
+    const NAMED_CLASS_EXPRESSION_SHADOWED_SUT_DYNAMIC_IMPORT_SOURCE: &str = r#"
+const SUT = "../safe";
+
+const Loader = class SUT {
+    static module = import(`${SUT}?ts=${Date.now()}`);
+};
+"#;
+
+    const ARBITRARY_DYNAMIC_IMPORT_SOURCE: &str = r"
+async function loadRoute(routeName: string) {
+    await import(`${routeName}/page?ts=${Date.now()}`);
+    await import(routeName);
+}
+";
+
     const IMPORT_META_FALSE_EDGE_SOURCE: &str = r#"
 const currentModule = import.meta.url;
 const payload = { label: "from", value: "./not-a-module" };
@@ -284,7 +503,7 @@ const chunk = loader.import("./chunk");
     const AMBIENT_DECLARATION_SOURCE: &str = r#"
 import type { Account } from "./account";
 
-declare namespace Hipp {
+declare namespace AppTypes {
     declare interface Session {
         account: Account;
     }
@@ -346,6 +565,400 @@ declare namespace Hipp {
             Box::from([super::UnsupportedDynamicImport {
                 kind: super::UnsupportedDynamicImportKind::NonLiteral,
             }]),
+        );
+        assert_eq!(
+            imports.dynamic_specifiers,
+            Box::<[roots::ImportSpecifier]>::from([])
+        );
+    }
+
+    #[test]
+    fn cache_busted_const_template_imports_resolve_as_dynamic_specifiers() {
+        let request = super::Request {
+            reader: FixtureReader {
+                source: CACHE_BUSTED_CONST_DYNAMIC_IMPORT_SOURCE,
+            },
+            path: path("src/utils/date.test.ts"),
+        };
+
+        // The fixture mirrors SUT helpers that reload modules with query strings;
+        // both imports should become ordinary dynamic graph edges.
+        let imports = super::imports(request).unwrap();
+
+        assert_eq!(
+            imports.dynamic_specifiers,
+            Box::<[roots::ImportSpecifier]>::from([
+                specifier("src/utils/date"),
+                specifier("../actions"),
+                specifier("../authReport"),
+                specifier("../dag-resolver"),
+                specifier("@/app/(dashboard)/billing/manual-eob/helpers"),
+            ]),
+        );
+        assert_eq!(imports.unsupported_dynamic_imports, Box::from([]));
+    }
+
+    #[test]
+    fn direct_cache_busted_template_import_resolves_as_dynamic_specifier() {
+        let request = super::Request {
+            reader: FixtureReader {
+                source: CACHE_BUSTED_DIRECT_TEMPLATE_IMPORT_SOURCE,
+            },
+            path: path("src/dashboard/metrics.test.tsx"),
+        };
+
+        // Direct template literals with a static path before the query are safe
+        // to keep because the cache-buster does not affect module resolution.
+        let imports = super::imports(request).unwrap();
+
+        assert_eq!(
+            imports.dynamic_specifiers,
+            Box::<[roots::ImportSpecifier]>::from([specifier("../dashboard/KPIMetricsCards")]),
+        );
+        assert_eq!(imports.unsupported_dynamic_imports, Box::from([]));
+    }
+
+    #[test]
+    fn string_literal_dynamic_import_query_strings_are_stripped() {
+        let request = super::Request {
+            reader: FixtureReader {
+                source: CACHE_BUSTED_STRING_LITERAL_IMPORT_SOURCE,
+            },
+            path: path("src/router.ts"),
+        };
+
+        // Literal cache-busting queries are runtime noise; the resolver needs
+        // only the module specifier portion for graph construction.
+        let imports = super::imports(request).unwrap();
+
+        assert_eq!(
+            imports.dynamic_specifiers,
+            Box::<[roots::ImportSpecifier]>::from([specifier("./lazy-panel")]),
+        );
+        assert_eq!(imports.unsupported_dynamic_imports, Box::from([]));
+    }
+
+    #[test]
+    fn const_identifier_dynamic_import_resolves_as_dynamic_specifier() {
+        let request = super::Request {
+            reader: FixtureReader {
+                source: CONST_IDENTIFIER_DYNAMIC_IMPORT_SOURCE,
+            },
+            path: path("src/app/sidebar.test.tsx"),
+        };
+
+        // Some tests intentionally avoid cache-busting shared provider modules;
+        // top-level const identifiers still provide enough static proof.
+        let imports = super::imports(request).unwrap();
+
+        assert_eq!(
+            imports.dynamic_specifiers,
+            Box::<[roots::ImportSpecifier]>::from([specifier("src/app/sidebarPrimitives")]),
+        );
+        assert_eq!(imports.unsupported_dynamic_imports, Box::from([]));
+    }
+
+    #[test]
+    fn nested_callback_const_template_import_resolves_as_dynamic_specifier() {
+        let request = super::Request {
+            reader: FixtureReader {
+                source: NESTED_CALLBACK_CONST_DYNAMIC_IMPORT_SOURCE,
+            },
+            path: path("src/features/widget.test.ts"),
+        };
+
+        // Test callbacks often declare SUT helpers locally; static lexical consts
+        // should still become graph edges when no runtime binding shadows them.
+        let imports = super::imports(request).unwrap();
+
+        assert_eq!(
+            imports.dynamic_specifiers,
+            Box::<[roots::ImportSpecifier]>::from([specifier("../utils")]),
+        );
+        assert_eq!(imports.unsupported_dynamic_imports, Box::from([]));
+    }
+
+    #[test]
+    fn parameter_shadowed_sut_template_import_remains_unsupported() {
+        let request = super::Request {
+            reader: FixtureReader {
+                source: PARAMETER_SHADOWED_SUT_DYNAMIC_IMPORT_SOURCE,
+            },
+            path: path("src/router.ts"),
+        };
+
+        // A parameter with the SUT name means the template uses runtime data, not
+        // the top-level const, so it must keep the graph fail-closed.
+        let imports = super::imports(request).unwrap();
+
+        assert_eq!(
+            imports.unsupported_dynamic_imports,
+            Box::from([super::UnsupportedDynamicImport {
+                kind: super::UnsupportedDynamicImportKind::NonLiteral,
+            }]),
+        );
+        assert_eq!(
+            imports.dynamic_specifiers,
+            Box::<[roots::ImportSpecifier]>::from([])
+        );
+    }
+
+    #[test]
+    fn local_shadowed_sut_template_import_remains_unsupported() {
+        let request = super::Request {
+            reader: FixtureReader {
+                source: LOCAL_SHADOWED_SUT_DYNAMIC_IMPORT_SOURCE,
+            },
+            path: path("src/router.ts"),
+        };
+
+        // Local bindings shadow the file-level SUT helper for the whole function
+        // body, including cache-busted templates that otherwise look static.
+        let imports = super::imports(request).unwrap();
+
+        assert_eq!(
+            imports.unsupported_dynamic_imports,
+            Box::from([super::UnsupportedDynamicImport {
+                kind: super::UnsupportedDynamicImportKind::NonLiteral,
+            }]),
+        );
+        assert_eq!(
+            imports.dynamic_specifiers,
+            Box::<[roots::ImportSpecifier]>::from([])
+        );
+    }
+
+    #[test]
+    fn loop_initializer_shadowed_sut_template_imports_remain_unsupported() {
+        let request = super::Request {
+            reader: FixtureReader {
+                source: LOOP_SHADOWED_SUT_DYNAMIC_IMPORT_SOURCE,
+            },
+            path: path("src/router.ts"),
+        };
+
+        // Loop initializer bindings are lexical runtime values, so templates
+        // inside for/for-in/for-of bodies must not use the file-level SUT const.
+        let imports = super::imports(request).unwrap();
+
+        assert_eq!(
+            imports.unsupported_dynamic_imports,
+            Box::from([
+                super::UnsupportedDynamicImport {
+                    kind: super::UnsupportedDynamicImportKind::NonLiteral,
+                },
+                super::UnsupportedDynamicImport {
+                    kind: super::UnsupportedDynamicImportKind::NonLiteral,
+                },
+                super::UnsupportedDynamicImport {
+                    kind: super::UnsupportedDynamicImportKind::NonLiteral,
+                },
+            ]),
+        );
+        assert_eq!(
+            imports.dynamic_specifiers,
+            Box::<[roots::ImportSpecifier]>::from([])
+        );
+    }
+
+    #[test]
+    fn top_level_loop_initializer_shadowed_sut_template_import_remains_unsupported() {
+        let request = super::Request {
+            reader: FixtureReader {
+                source: TOP_LEVEL_LOOP_SHADOWED_SUT_DYNAMIC_IMPORT_SOURCE,
+            },
+            path: path("src/router.ts"),
+        };
+
+        // A top-level loop introduces its own lexical binding, so the template
+        // cannot safely reuse the file-level SUT const.
+        let imports = super::imports(request).unwrap();
+
+        assert_eq!(
+            imports.unsupported_dynamic_imports,
+            Box::from([super::UnsupportedDynamicImport {
+                kind: super::UnsupportedDynamicImportKind::NonLiteral,
+            }]),
+        );
+        assert_eq!(
+            imports.dynamic_specifiers,
+            Box::<[roots::ImportSpecifier]>::from([])
+        );
+    }
+
+    #[test]
+    fn control_flow_loop_initializer_shadowed_sut_template_import_remains_unsupported() {
+        let request = super::Request {
+            reader: FixtureReader {
+                source: CONTROL_FLOW_LOOP_SHADOWED_SUT_DYNAMIC_IMPORT_SOURCE,
+            },
+            path: path("src/router.ts"),
+        };
+
+        // Non-block control-flow parents still leave the loop initializer in
+        // scope for the loop body, so the template must fail closed.
+        let imports = super::imports(request).unwrap();
+
+        assert_eq!(
+            imports.unsupported_dynamic_imports,
+            Box::from([super::UnsupportedDynamicImport {
+                kind: super::UnsupportedDynamicImportKind::NonLiteral,
+            }]),
+        );
+        assert_eq!(
+            imports.dynamic_specifiers,
+            Box::<[roots::ImportSpecifier]>::from([])
+        );
+    }
+
+    #[test]
+    fn catch_parameter_shadowed_sut_template_import_remains_unsupported() {
+        let request = super::Request {
+            reader: FixtureReader {
+                source: CATCH_PARAMETER_SHADOWED_SUT_DYNAMIC_IMPORT_SOURCE,
+            },
+            path: path("src/router.ts"),
+        };
+
+        // Catch parameters are runtime bindings inside the catch body and must
+        // not resolve through a same-named top-level SUT const.
+        let imports = super::imports(request).unwrap();
+
+        assert_eq!(
+            imports.unsupported_dynamic_imports,
+            Box::from([super::UnsupportedDynamicImport {
+                kind: super::UnsupportedDynamicImportKind::NonLiteral,
+            }]),
+        );
+        assert_eq!(
+            imports.dynamic_specifiers,
+            Box::<[roots::ImportSpecifier]>::from([])
+        );
+    }
+
+    #[test]
+    fn switch_case_shadowed_sut_template_import_remains_unsupported() {
+        let request = super::Request {
+            reader: FixtureReader {
+                source: SWITCH_CASE_SHADOWED_SUT_DYNAMIC_IMPORT_SOURCE,
+            },
+            path: path("src/router.ts"),
+        };
+
+        // Switch cases are not block statements, but lexical declarations in a
+        // case still shadow the file-level SUT const for later case statements.
+        let imports = super::imports(request).unwrap();
+
+        assert_eq!(
+            imports.unsupported_dynamic_imports,
+            Box::from([super::UnsupportedDynamicImport {
+                kind: super::UnsupportedDynamicImportKind::NonLiteral,
+            }]),
+        );
+        assert_eq!(
+            imports.dynamic_specifiers,
+            Box::<[roots::ImportSpecifier]>::from([])
+        );
+    }
+
+    #[test]
+    fn switch_sibling_case_shadowed_sut_template_import_remains_unsupported() {
+        let request = super::Request {
+            reader: FixtureReader {
+                source: SWITCH_SIBLING_CASE_SHADOWED_SUT_DYNAMIC_IMPORT_SOURCE,
+            },
+            path: path("src/router.ts"),
+        };
+
+        // Switch lexical scope spans cases for this evaluator, so a SUT binding
+        // in one case blocks top-level SUT resolution in sibling cases.
+        let imports = super::imports(request).unwrap();
+
+        assert_eq!(
+            imports.unsupported_dynamic_imports,
+            Box::from([super::UnsupportedDynamicImport {
+                kind: super::UnsupportedDynamicImportKind::NonLiteral,
+            }]),
+        );
+        assert_eq!(
+            imports.dynamic_specifiers,
+            Box::<[roots::ImportSpecifier]>::from([])
+        );
+    }
+
+    #[test]
+    fn named_function_expression_shadowed_sut_template_import_remains_unsupported() {
+        let request = super::Request {
+            reader: FixtureReader {
+                source: NAMED_FUNCTION_EXPRESSION_SHADOWED_SUT_DYNAMIC_IMPORT_SOURCE,
+            },
+            path: path("src/router.ts"),
+        };
+
+        // A named function expression exposes its name inside the function body,
+        // so a matching SUT name is not proof of the top-level const.
+        let imports = super::imports(request).unwrap();
+
+        assert_eq!(
+            imports.unsupported_dynamic_imports,
+            Box::from([super::UnsupportedDynamicImport {
+                kind: super::UnsupportedDynamicImportKind::NonLiteral,
+            }]),
+        );
+        assert_eq!(
+            imports.dynamic_specifiers,
+            Box::<[roots::ImportSpecifier]>::from([])
+        );
+    }
+
+    #[test]
+    fn named_class_expression_shadowed_sut_template_import_remains_unsupported() {
+        let request = super::Request {
+            reader: FixtureReader {
+                source: NAMED_CLASS_EXPRESSION_SHADOWED_SUT_DYNAMIC_IMPORT_SOURCE,
+            },
+            path: path("src/router.ts"),
+        };
+
+        // A named class expression exposes its name inside class body traversal,
+        // so same-named templates cannot prove they reference the top-level SUT.
+        let imports = super::imports(request).unwrap();
+
+        assert_eq!(
+            imports.unsupported_dynamic_imports,
+            Box::from([super::UnsupportedDynamicImport {
+                kind: super::UnsupportedDynamicImportKind::NonLiteral,
+            }]),
+        );
+        assert_eq!(
+            imports.dynamic_specifiers,
+            Box::<[roots::ImportSpecifier]>::from([])
+        );
+    }
+
+    #[test]
+    fn arbitrary_template_and_identifier_imports_remain_unsupported() {
+        let request = super::Request {
+            reader: FixtureReader {
+                source: ARBITRARY_DYNAMIC_IMPORT_SOURCE,
+            },
+            path: path("src/router.ts"),
+        };
+
+        // Templates that compute path structure and bare identifier imports still
+        // lack enough static proof, so selection must continue to fail closed.
+        let imports = super::imports(request).unwrap();
+
+        assert_eq!(
+            imports.unsupported_dynamic_imports,
+            Box::from([
+                super::UnsupportedDynamicImport {
+                    kind: super::UnsupportedDynamicImportKind::NonLiteral,
+                },
+                super::UnsupportedDynamicImport {
+                    kind: super::UnsupportedDynamicImportKind::NonLiteral,
+                },
+            ]),
         );
         assert_eq!(
             imports.dynamic_specifiers,
