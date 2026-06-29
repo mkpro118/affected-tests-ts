@@ -3,10 +3,10 @@
 use crate::contract;
 use crate::failure;
 
-/// Shell-renderer contract for space-delimited selected tests.
+/// Shell-renderer contract for newline-delimited selected tests.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShellOutput {
-    /// Stable sorted shell arguments.
+    /// Stable sorted output lines.
     pub lines: Box<[Box<str>]>,
 }
 
@@ -29,7 +29,7 @@ pub struct GraphDebugOutput {
 /// Output format selected after CLI parsing and TTY detection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Format {
-    /// Space-delimited shell output.
+    /// Newline-delimited shell output.
     Shell,
     /// Strict JSON contract output.
     Json,
@@ -135,7 +135,7 @@ where
 
 fn render_shell(result: &contract::CommandResult) -> Box<str> {
     match result {
-        contract::CommandResult::Partial(partial) => space_join(partial.tests.as_ref()),
+        contract::CommandResult::Partial(partial) => newline_join(partial.tests.as_ref()),
         contract::CommandResult::Full(_full) => Box::<str>::from(""),
         contract::CommandResult::None(_none) => Box::<str>::from(""),
         contract::CommandResult::Error(_error) => Box::<str>::from(""),
@@ -193,22 +193,6 @@ fn newline_join(lines: &[Box<str>]) -> Box<str> {
     content.into_boxed_str()
 }
 
-fn space_join(arguments: &[Box<str>]) -> Box<str> {
-    if arguments.is_empty() {
-        return Box::<str>::from("");
-    }
-
-    let mut content = String::new();
-    for argument in arguments {
-        if !content.is_empty() {
-            content.push(' ');
-        }
-        content.push_str(argument.as_ref());
-    }
-
-    content.into_boxed_str()
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync;
@@ -258,7 +242,7 @@ mod tests {
         let plain_sink = RecordingSink::default();
 
         // These paths are already sorted so the renderer contract can focus on
-        // preserving shell argument order instead of performing selection work.
+        // preserving output order instead of performing selection work.
         super::render(super::RenderRequest {
             sink: shell_sink.clone(),
             format: super::Format::Shell,
@@ -280,7 +264,7 @@ mod tests {
 
         assert_eq!(
             shell_sink.content.lock().unwrap().as_str(),
-            "src/accounts.test.ts src/button.test.tsx"
+            "src/accounts.test.ts\nsrc/button.test.tsx\n"
         );
         assert!(
             json_sink
@@ -296,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_output_emits_only_partial_test_path_arguments() {
+    fn shell_output_emits_only_partial_test_path_lines() {
         let full_result = contract::CommandResult::Full(contract::FullResult {
             reason: Box::<str>::from("global invalidator changed"),
         });
@@ -308,11 +292,11 @@ mod tests {
             message: Box::<str>::from("invalid configuration"),
         });
 
-        // Shell output is consumed through command substitution, so non-path
-        // statuses must not become accidental test arguments on stdout.
+        // Shell output is consumed by scripts, so non-path statuses must not
+        // become accidental test paths on stdout.
         assert_eq!(
             shell_output_for(partial_result()),
-            "src/accounts.test.ts src/button.test.tsx"
+            "src/accounts.test.ts\nsrc/button.test.tsx\n"
         );
         assert_eq!(shell_output_for(full_result), "");
         assert_eq!(shell_output_for(none_result), "");

@@ -245,11 +245,11 @@ fn default_shell_tui_docker_graph_and_explain_commands_are_wired() {
     assert_success(&docker_output);
     assert_success(&graph_output);
     assert_success(&explain_output);
-    assert_eq!(stdout(&shell_output), "tests/value.test.ts");
+    assert_eq!(stdout(&shell_output), "tests/value.test.ts\n");
     assert_eq!(stdout(&tui_output), "partial\ntests/value.test.ts\n");
     assert!(stdout(&docker_output).contains("=> [result"));
     assert!(stdout(&graph_output).contains(r#""nodes""#));
-    assert_eq!(stdout(&explain_output), "tests/value.test.ts");
+    assert_eq!(stdout(&explain_output), "tests/value.test.ts\n");
 }
 
 #[test]
