@@ -138,7 +138,7 @@ fn run_selection(request: SelectionCommand) -> failure::Result<()> {
 
 fn run_graph(request: GraphCommand) -> failure::Result<()> {
     let pipeline = app_pipeline::build(repository_root()?)?;
-    let graph = pipeline.graph?;
+    let graph = pipeline.output_graph?;
     let graph_result = app_contract::graph_result(app_contract::GraphRequest {
         graph: &graph,
         files: &pipeline.files,

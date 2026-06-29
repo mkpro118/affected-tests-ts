@@ -19,6 +19,8 @@ pub struct Pipeline {
     pub files: discovery::Files,
     /// Dependency graph or fail-closed graph construction result.
     pub graph: failure::Result<dependencies::DependencyGraph>,
+    /// Inspectable graph output that preserves static edges across dynamic imports.
+    pub output_graph: failure::Result<dependencies::DependencyGraph>,
 }
 
 /// File classifier used by affected selection at the app edge.
@@ -115,14 +117,25 @@ pub fn build(repository_path: Box<str>) -> failure::Result<Pipeline> {
         file_catalog: file_system.clone(),
     })?;
     let graph_files = all_graph_files(&files);
-    let imports = dependencies::LocalImports::new(dependencies::LocalImportsRequest {
+    let strict_imports = dependencies::LocalImports::new(dependencies::LocalImportsRequest {
         config: config.clone(),
         reader: file_system.clone(),
         resolver: Resolver,
-        probe: file_system,
+        probe: file_system.clone(),
     });
     let graph = dependencies::build(dependencies::GraphBuildRequest {
-        imports,
+        imports: strict_imports,
+        files: graph_files.clone(),
+    });
+    let output_imports =
+        dependencies::LocalImports::for_graph_output(dependencies::LocalImportsRequest {
+            config: config.clone(),
+            reader: file_system.clone(),
+            resolver: Resolver,
+            probe: file_system,
+        });
+    let output_graph = dependencies::build(dependencies::GraphBuildRequest {
+        imports: output_imports,
         files: graph_files,
     });
 
@@ -130,6 +143,7 @@ pub fn build(repository_path: Box<str>) -> failure::Result<Pipeline> {
         config,
         files,
         graph,
+        output_graph,
     })
 }
 

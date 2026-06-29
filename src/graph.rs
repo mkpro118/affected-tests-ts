@@ -53,6 +53,13 @@ pub struct LocalImports<C, R, M, P> {
     reader: R,
     resolver: M,
     probe: P,
+    dynamic_import_mode: DynamicImportMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DynamicImportMode {
+    Configured,
+    IgnoreUnsupported,
 }
 
 impl<C, R, M, P> LocalImports<C, R, M, P> {
@@ -64,6 +71,19 @@ impl<C, R, M, P> LocalImports<C, R, M, P> {
             reader: request.reader,
             resolver: request.resolver,
             probe: request.probe,
+            dynamic_import_mode: DynamicImportMode::Configured,
+        }
+    }
+
+    /// Creates an import source for inspectable graph output.
+    #[must_use]
+    pub fn for_graph_output(request: LocalImportsRequest<C, R, M, P>) -> Self {
+        Self {
+            config: request.config,
+            reader: request.reader,
+            resolver: request.resolver,
+            probe: request.probe,
+            dynamic_import_mode: DynamicImportMode::IgnoreUnsupported,
         }
     }
 }
@@ -84,8 +104,11 @@ where
             path: path.clone(),
         })?;
 
-        if should_fail_for_dynamic_imports(&self.config, imports.unsupported_dynamic_imports.len())
-        {
+        if should_fail_for_dynamic_imports(&DynamicImportFailureRequest {
+            config: &self.config,
+            mode: self.dynamic_import_mode,
+            unsupported_count: imports.unsupported_dynamic_imports.len(),
+        }) {
             return Err(failure::AppError::UnknownDynamicImport {
                 importer: path.clone(),
             });
@@ -165,12 +188,19 @@ struct NodeEdges {
     dependencies: Box<[roots::RootRelativePath]>,
 }
 
-fn should_fail_for_dynamic_imports<C>(config: &C, unsupported_count: usize) -> bool
+struct DynamicImportFailureRequest<'a, C> {
+    config: &'a C,
+    mode: DynamicImportMode,
+    unsupported_count: usize,
+}
+
+fn should_fail_for_dynamic_imports<C>(request: &DynamicImportFailureRequest<'_, C>) -> bool
 where
     C: settings::View,
 {
-    unsupported_count > 0
-        && config.dynamic_imports() == settings::UnknownDynamicImportBehavior::FailClosed
+    request.mode == DynamicImportMode::Configured
+        && request.unsupported_count > 0
+        && request.config.dynamic_imports() == settings::UnknownDynamicImportBehavior::FailClosed
 }
 
 fn resolve_imports<C, M, P>(
@@ -423,6 +453,38 @@ mod tests {
             error,
             failure::AppError::UnknownDynamicImport { importer } if importer == path("src/router.ts")
         ));
+    }
+
+    #[test]
+    fn graph_output_imports_keep_static_edges_across_dynamic_imports() {
+        let file_system = vfs::VirtualFileSystem::with_files(Box::from([
+            (
+                path("src/router.ts"),
+                Box::<str>::from("import './routes';\nconst page = import(routeName);"),
+            ),
+            (
+                path("src/routes.ts"),
+                Box::<str>::from("export const routes = [];"),
+            ),
+        ]));
+        let imports = super::LocalImports::for_graph_output(super::LocalImportsRequest {
+            config: FixtureConfig {
+                dynamic_imports: settings::UnknownDynamicImportBehavior::FailClosed,
+            },
+            reader: file_system.clone(),
+            resolver: FixtureResolver,
+            probe: file_system,
+        });
+
+        // Graph inspection should remain useful even when selection will fail
+        // closed for an unsupported dynamic import in the same file.
+        let dependencies =
+            super::ImportResolver::dependencies_for(&imports, &path("src/router.ts")).unwrap();
+
+        assert_eq!(
+            dependencies,
+            Box::<[roots::RootRelativePath]>::from([path("src/routes.ts")]),
+        );
     }
 
     #[test]
