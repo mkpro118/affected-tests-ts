@@ -1,7 +1,9 @@
 //! Configuration contracts for discovery, resolution, and invalidation rules.
 
-use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::path;
+
+use serde::Deserialize;
 
 use crate::failure;
 use crate::roots;
@@ -306,8 +308,12 @@ struct TypeScriptConfig {
 impl From<TypeScriptConfig> for FileConfig {
     fn from(config: TypeScriptConfig) -> Self {
         Self {
-            source_includes: config.include,
-            excludes: config.exclude,
+            source_includes: config
+                .include
+                .map(|patterns| normalize_typescript_includes(patterns.as_ref())),
+            excludes: config
+                .exclude
+                .map(|patterns| normalize_typescript_excludes(patterns.as_ref())),
             test_patterns: None,
             global_invalidators: None,
             dynamic_imports: None,
@@ -435,6 +441,60 @@ fn normalize_target(base_url: Option<&str>, target: &str) -> Box<str> {
     }
 }
 
+fn normalize_typescript_includes(patterns: &[Box<str>]) -> Box<[Box<str>]> {
+    patterns
+        .iter()
+        .flat_map(|pattern| typescript_include_patterns(pattern.as_ref()))
+        .collect()
+}
+
+fn normalize_typescript_excludes(patterns: &[Box<str>]) -> Box<[Box<str>]> {
+    patterns
+        .iter()
+        .map(|pattern| typescript_exclude_pattern(pattern.as_ref()))
+        .collect()
+}
+
+fn typescript_include_patterns(pattern: &str) -> Box<[Box<str>]> {
+    let normalized = normalize_typescript_pattern_path(pattern);
+    if is_directory_style_typescript_pattern(normalized) {
+        Box::from([
+            Box::<str>::from(format!("{normalized}/**/*.ts")),
+            Box::<str>::from(format!("{normalized}/**/*.tsx")),
+        ])
+    } else {
+        Box::from([Box::<str>::from(normalized)])
+    }
+}
+
+fn typescript_exclude_pattern(pattern: &str) -> Box<str> {
+    let normalized = normalize_typescript_pattern_path(pattern);
+    if is_directory_style_typescript_pattern(normalized) {
+        Box::<str>::from(format!("{normalized}/**"))
+    } else {
+        Box::<str>::from(normalized)
+    }
+}
+
+fn is_directory_style_typescript_pattern(pattern: &str) -> bool {
+    !pattern.is_empty()
+        && !contains_glob_meta(pattern)
+        && path::Path::new(pattern).extension().is_none()
+}
+
+fn contains_glob_meta(pattern: &str) -> bool {
+    pattern.contains('*')
+        || pattern.contains('?')
+        || pattern.contains('[')
+        || pattern.contains(']')
+        || pattern.contains('{')
+        || pattern.contains('}')
+}
+
+fn normalize_typescript_pattern_path(pattern: &str) -> &str {
+    trim_current_directory(pattern).trim_end_matches('/')
+}
+
 fn trim_current_directory(path: &str) -> &str {
     if path == "." {
         ""
@@ -533,6 +593,11 @@ fn default_path_mappings() -> Box<[PathMapping]> {
 mod tests {
     use crate::failure;
     use crate::roots;
+
+    const TSCONFIG_DIRECTORY_ENTRIES: &str = r#"{
+  "include": ["./src", "app/**/*.ts", "next-env.d.ts"],
+  "exclude": ["./tests", "build/", "src/generated/**", "scripts/setup.ts"]
+}"#;
 
     #[derive(Clone, Debug, Default)]
     struct FixtureFileSystem {
@@ -700,6 +765,39 @@ mod tests {
                 super::PathMapping::try_new("@lib/*", Box::from([Box::<str>::from("src/lib/*")]),)
                     .unwrap()
             ]
+        );
+    }
+
+    #[test]
+    fn tsconfig_directory_entries_expand_to_recursive_typescript_globs() {
+        let request = super::LoadRequest {
+            file_system: FixtureFileSystem {
+                content: Some(Box::<str>::from(TSCONFIG_DIRECTORY_ENTRIES)),
+            },
+            config_path: Some(roots::RootRelativePath::try_from("tsconfig.json").unwrap()),
+        };
+
+        let config = super::load(request).unwrap();
+
+        // Directory-style tsconfig entries mean recursive TS source roots, while
+        // explicit globs and file paths are already precise enough to preserve.
+        assert_eq!(
+            pattern_values(super::View::source_includes(&config)),
+            Box::<[Box<str>]>::from([
+                Box::<str>::from("src/**/*.ts"),
+                Box::<str>::from("src/**/*.tsx"),
+                Box::<str>::from("app/**/*.ts"),
+                Box::<str>::from("next-env.d.ts"),
+            ]),
+        );
+        assert_eq!(
+            pattern_values(super::View::excludes(&config)),
+            Box::<[Box<str>]>::from([
+                Box::<str>::from("tests/**"),
+                Box::<str>::from("build/**"),
+                Box::<str>::from("src/generated/**"),
+                Box::<str>::from("scripts/setup.ts"),
+            ]),
         );
     }
 

@@ -67,14 +67,14 @@ pub trait GitRepository {
 /// Process-backed repository adapter for real Git invocations.
 #[derive(Clone, Debug)]
 pub struct ProcessRepository {
-    root: Box<str>,
+    working_directory: Box<str>,
 }
 
 impl ProcessRepository {
-    /// Creates a Git adapter rooted at a repository directory.
+    /// Creates a Git adapter rooted at the invocation workspace.
     #[must_use]
-    pub const fn for_root(root: Box<str>) -> Self {
-        Self { root }
+    pub const fn for_root(working_directory: Box<str>) -> Self {
+        Self { working_directory }
     }
 }
 
@@ -83,9 +83,10 @@ impl GitRepository for ProcessRepository {
         let range = format!("{}...{}", request.base, request.head);
         let output = process::Command::new("git")
             .arg("-C")
-            .arg(path::Path::new(self.root.as_ref()))
+            .arg(path::Path::new(self.working_directory.as_ref()))
             .arg("diff")
             .arg("--name-status")
+            .arg("--relative")
             .arg("--find-renames")
             .arg("--diff-filter=ACMRTD")
             .arg(range)

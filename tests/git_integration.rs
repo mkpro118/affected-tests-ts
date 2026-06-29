@@ -9,6 +9,58 @@ use std::sync::atomic;
 const BLUEPRINT_CONFIG: &str = include_str!("../fixtures/repos/blueprint/affected-tests.json");
 const BLUEPRINT_SOURCE: &str = include_str!("../fixtures/repos/blueprint/src/value.ts");
 const BLUEPRINT_TEST: &str = include_str!("../fixtures/repos/blueprint/tests/value.test.ts");
+const MONOREPO_TSCONFIG: &str = r#"{
+  "include": ["./src", "./tests"],
+  "exclude": ["./build"]
+}
+"#;
+const RANGE_ARGS: &[&str] = &["--base", "origin/main", "--head", "HEAD"];
+const JSON_EXPLAIN_ARGS: &[&str] = &[
+    "--base",
+    "origin/main",
+    "--head",
+    "HEAD",
+    "--format",
+    "json",
+    "--explain",
+];
+const PLAIN_EXPLAIN_ARGS: &[&str] = &[
+    "--base",
+    "origin/main",
+    "--head",
+    "HEAD",
+    "--format",
+    "plain",
+    "--explain",
+];
+const DOCKER_EXPLAIN_ARGS: &[&str] = &[
+    "--base",
+    "origin/main",
+    "--head",
+    "HEAD",
+    "--format",
+    "docker",
+    "--explain",
+];
+const TUI_EXPLAIN_ARGS: &[&str] = &[
+    "--base",
+    "origin/main",
+    "--head",
+    "HEAD",
+    "--format",
+    "tui",
+    "--explain",
+];
+const GRAPH_JSON_ARGS: &[&str] = &["graph", "--format", "json"];
+const EXPLAIN_WITH_GLOBAL_RANGE_ARGS: &[&str] = &[
+    "explain",
+    "src/value.ts",
+    "--base",
+    "origin/main",
+    "--head",
+    "HEAD",
+];
+const VERSION_ARGS: &[&str] = &["--version"];
 
 static NEXT_REPOSITORY_ID: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
 
@@ -43,6 +95,17 @@ struct WriteFixtureFileRequest<'a> {
 struct CommandRequest<'a> {
     repository_path: &'a path::Path,
     args: &'a [&'a str],
+}
+
+struct MonorepoCommandOutputs {
+    shell: process::Output,
+    json: process::Output,
+    plain: process::Output,
+    docker: process::Output,
+    tui: process::Output,
+    graph: process::Output,
+    explain: process::Output,
+    version: process::Output,
 }
 
 fn run_git(repository_path: &path::Path, args: &[&str]) -> process::Output {
@@ -89,6 +152,24 @@ fn materialize_blueprint(repository_path: &path::Path) {
     write_fixture_file(&WriteFixtureFileRequest {
         repository_path,
         relative_path: "tests/value.test.ts",
+        content: BLUEPRINT_TEST,
+    });
+}
+
+fn materialize_monorepo_workspace(repository_path: &path::Path) {
+    write_fixture_file(&WriteFixtureFileRequest {
+        repository_path,
+        relative_path: "apps/web/tsconfig.json",
+        content: MONOREPO_TSCONFIG,
+    });
+    write_fixture_file(&WriteFixtureFileRequest {
+        repository_path,
+        relative_path: "apps/web/src/value.ts",
+        content: BLUEPRINT_SOURCE,
+    });
+    write_fixture_file(&WriteFixtureFileRequest {
+        repository_path,
+        relative_path: "apps/web/tests/value.test.ts",
         content: BLUEPRINT_TEST,
     });
 }
@@ -153,6 +234,54 @@ fn create_changed_source_repo(name: &str) -> path::PathBuf {
     repository_path
 }
 
+fn create_changed_monorepo_workspace(name: &str) -> path::PathBuf {
+    let repository_path = fixture_repo_path(name);
+
+    if repository_path.exists() {
+        fs::remove_dir_all(&repository_path).unwrap();
+    }
+
+    fs::create_dir_all(&repository_path).unwrap();
+    assert_success(&run_command(
+        process::Command::new("git")
+            .arg("init")
+            .arg("-b")
+            .arg("main")
+            .arg(&repository_path),
+    ));
+    materialize_monorepo_workspace(&repository_path);
+    assert_git_success(&run_git(
+        &repository_path,
+        &[
+            "add",
+            "apps/web/tsconfig.json",
+            "apps/web/src/value.ts",
+            "apps/web/tests/value.test.ts",
+        ],
+    ));
+    commit_fixture_change(&repository_path, "Add monorepo TypeScript workspace");
+    assert_git_success(&run_git(
+        &repository_path,
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    ));
+    assert_git_success(&run_git(
+        &repository_path,
+        &["checkout", "-b", "feature/change-web-value"],
+    ));
+    write_fixture_file(&WriteFixtureFileRequest {
+        repository_path: &repository_path,
+        relative_path: "apps/web/src/value.ts",
+        content: "export const value = 3;\n",
+    });
+    assert_git_success(&run_git(
+        &repository_path,
+        &["add", "apps/web/src/value.ts"],
+    ));
+    commit_fixture_change(&repository_path, "Change web source value");
+
+    repository_path.join("apps/web")
+}
+
 fn run_affected_tests(request: CommandRequest<'_>) -> process::Output {
     process::Command::new(env!("CARGO_BIN_EXE_affected-tests-ts"))
         .current_dir(request.repository_path)
@@ -163,6 +292,69 @@ fn run_affected_tests(request: CommandRequest<'_>) -> process::Output {
 
 fn stdout(output: &process::Output) -> String {
     String::from_utf8(output.stdout.clone()).unwrap()
+}
+
+fn assert_workspace_relative_output(output: &process::Output) {
+    let content = stdout(output);
+
+    assert!(content.contains("tests/value.test.ts"));
+    assert!(!content.contains("apps/web/tests/value.test.ts"));
+    assert!(!content.contains("apps/web/src/value.ts"));
+}
+
+fn run_workspace_command(workspace_path: &path::Path, args: &[&str]) -> process::Output {
+    run_affected_tests(CommandRequest {
+        repository_path: workspace_path,
+        args,
+    })
+}
+
+fn run_monorepo_workspace_commands(workspace_path: &path::Path) -> MonorepoCommandOutputs {
+    MonorepoCommandOutputs {
+        shell: run_workspace_command(workspace_path, RANGE_ARGS),
+        json: run_workspace_command(workspace_path, JSON_EXPLAIN_ARGS),
+        plain: run_workspace_command(workspace_path, PLAIN_EXPLAIN_ARGS),
+        docker: run_workspace_command(workspace_path, DOCKER_EXPLAIN_ARGS),
+        tui: run_workspace_command(workspace_path, TUI_EXPLAIN_ARGS),
+        graph: run_workspace_command(workspace_path, GRAPH_JSON_ARGS),
+        explain: run_workspace_command(workspace_path, EXPLAIN_WITH_GLOBAL_RANGE_ARGS),
+        version: run_workspace_command(workspace_path, VERSION_ARGS),
+    }
+}
+
+fn assert_monorepo_commands_succeeded(outputs: &MonorepoCommandOutputs) {
+    assert_success(&outputs.shell);
+    assert_success(&outputs.json);
+    assert_success(&outputs.plain);
+    assert_success(&outputs.docker);
+    assert_success(&outputs.tui);
+    assert_success(&outputs.graph);
+    assert_success(&outputs.explain);
+    assert_success(&outputs.version);
+}
+
+fn assert_monorepo_selection_outputs(outputs: &MonorepoCommandOutputs) {
+    assert_eq!(stdout(&outputs.shell), "tests/value.test.ts\n");
+    assert!(stdout(&outputs.json).contains(r#""changedFile":"src/value.ts""#));
+    assert_workspace_relative_output(&outputs.json);
+    assert_workspace_relative_output(&outputs.plain);
+    assert_workspace_relative_output(&outputs.tui);
+    assert!(stdout(&outputs.docker).contains("partial: 1 affected test"));
+    assert!(!stdout(&outputs.docker).contains("apps/web/"));
+}
+
+fn assert_monorepo_graph_output(output: &process::Output) {
+    let content = stdout(output);
+
+    assert!(content.contains(r#""path":"src/value.ts""#));
+    assert!(content.contains(r#""path":"tests/value.test.ts""#));
+    assert!(content.contains(r#""from":"tests/value.test.ts""#));
+    assert!(!content.contains(r#""nodes":[],"edges":[]"#));
+}
+
+fn assert_monorepo_metadata_outputs(outputs: &MonorepoCommandOutputs) {
+    assert_eq!(stdout(&outputs.explain), "tests/value.test.ts\n");
+    assert!(stdout(&outputs.version).contains(env!("CARGO_PKG_VERSION")));
 }
 
 #[test]
@@ -250,6 +442,19 @@ fn default_shell_tui_docker_graph_and_explain_commands_are_wired() {
     assert!(stdout(&docker_output).contains("=> [result"));
     assert!(stdout(&graph_output).contains(r#""nodes""#));
     assert_eq!(stdout(&explain_output), "tests/value.test.ts\n");
+}
+
+#[test]
+fn binary_run_from_monorepo_workspace_emits_workspace_relative_paths() {
+    let workspace_path = create_changed_monorepo_workspace("monorepo-workspace");
+    let outputs = run_monorepo_workspace_commands(&workspace_path);
+
+    // The binary is invoked from apps/web even though Git metadata lives above
+    // it, matching a real TypeScript package inside a larger monorepo.
+    assert_monorepo_commands_succeeded(&outputs);
+    assert_monorepo_selection_outputs(&outputs);
+    assert_monorepo_graph_output(&outputs.graph);
+    assert_monorepo_metadata_outputs(&outputs);
 }
 
 #[test]

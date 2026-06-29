@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 /// Parsed top-level CLI arguments.
 #[derive(Debug, Parser)]
-#[command(name = "affected-tests-ts")]
+#[command(name = "affected-tests-ts", version)]
 pub struct Args {
     /// Optional subcommand; selection is the default when omitted.
     #[command(subcommand)]
@@ -13,10 +13,10 @@ pub struct Args {
     #[arg(long = "format", value_enum, default_value = "shell", global = true)]
     pub format: Format,
     /// Git base revision used for changed-file detection.
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub base: Option<Box<str>>,
     /// Git head revision used for changed-file detection.
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub head: Option<Box<str>>,
     /// Include explain reason chains in formats that support them.
     #[arg(long)]
