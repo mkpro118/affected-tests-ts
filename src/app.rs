@@ -123,6 +123,7 @@ fn run_selection(request: SelectionCommand) -> failure::Result<()> {
     let contract = app_contract::command_result(app_contract::SelectionOutputRequest {
         result,
         changes: &changes,
+        files: &pipeline.files,
         include_reasons: request.include_reasons,
     });
 
@@ -172,6 +173,7 @@ fn run_explain(request: ExplainCommand) -> failure::Result<()> {
     })?;
     let contract = app_contract::command_result(app_contract::SelectionOutputRequest {
         result,
+        files: &pipeline.files,
         changes: &changes,
         include_reasons: true,
     });
