@@ -55,7 +55,15 @@ impl logs::StepOutputSink for DockerSink {
 /// Returns an error when serialization, terminal drawing, or stdout writing fails.
 pub fn render(request: Command) -> failure::Result<()> {
     match request.format {
-        presentation::Format::Shell | presentation::Format::Json | presentation::Format::Plain => {
+        presentation::Format::Shell => {
+            write_shell_diagnostic(&request.result)?;
+            presentation::render(presentation::RenderRequest {
+                sink: StdoutSink,
+                format: request.format,
+                result: request.result,
+            })
+        }
+        presentation::Format::Json | presentation::Format::Plain => {
             presentation::render(presentation::RenderRequest {
                 sink: StdoutSink,
                 format: request.format,
@@ -116,6 +124,34 @@ pub fn write_stdout(content: &str) -> failure::Result<()> {
         .map_err(|error| failure::AppError::Output {
             message: format!("failed to write stdout: {error}").into_boxed_str(),
         })
+}
+
+fn write_stderr(content: &str) -> failure::Result<()> {
+    io::stderr()
+        .lock()
+        .write_all(content.as_bytes())
+        .map_err(|error| failure::AppError::Output {
+            message: format!("failed to write stderr: {error}").into_boxed_str(),
+        })
+}
+
+fn write_shell_diagnostic(result: &contract::CommandResult) -> failure::Result<()> {
+    if let Some(diagnostic) = shell_diagnostic(result) {
+        write_stderr(diagnostic.as_ref())?;
+    }
+
+    Ok(())
+}
+
+fn shell_diagnostic(result: &contract::CommandResult) -> Option<Box<str>> {
+    match result {
+        contract::CommandResult::Full(full) => Some(
+            format!("affected-tests-ts: full run required: {}\n", full.reason).into_boxed_str(),
+        ),
+        contract::CommandResult::Partial(_)
+        | contract::CommandResult::None(_)
+        | contract::CommandResult::Error(_) => None,
+    }
 }
 
 fn render_tui(request: Command) -> failure::Result<()> {
@@ -190,9 +226,8 @@ fn progress_events(
 fn selected_test_count(result: &contract::CommandResult) -> usize {
     match result {
         contract::CommandResult::Partial(partial) => partial.tests.len(),
-        contract::CommandResult::Full(_)
-        | contract::CommandResult::None(_)
-        | contract::CommandResult::Error(_) => 0,
+        contract::CommandResult::Full(full) => full.tests.len(),
+        contract::CommandResult::None(_) | contract::CommandResult::Error(_) => 0,
     }
 }
 
@@ -227,5 +262,28 @@ fn panel(id: &str, title: &str) -> dashboard::TuiPanel {
     dashboard::TuiPanel {
         id: Box::<str>::from(id),
         title: Box::<str>::from(title),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::contract;
+
+    #[test]
+    fn shell_diagnostic_reports_full_reason_without_stdout_status_text() {
+        let diagnostic =
+            super::shell_diagnostic(&contract::CommandResult::Full(contract::FullResult {
+                reason: Box::<str>::from(
+                    "unresolved local import `@/constants/timezones` in: src/utils/date.ts",
+                ),
+                tests: Box::from([Box::<str>::from("src/utils/date.test.ts")]),
+            }));
+
+        assert_eq!(
+            diagnostic.as_deref(),
+            Some(
+                "affected-tests-ts: full run required: unresolved local import `@/constants/timezones` in: src/utils/date.ts\n"
+            ),
+        );
     }
 }

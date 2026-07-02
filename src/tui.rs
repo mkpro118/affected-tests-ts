@@ -847,6 +847,7 @@ fn summary_lines(model: &Model) -> Box<[Box<str>]> {
         Some(contract::CommandResult::Full(full)) => Box::from([
             Box::<str>::from("full run required"),
             format!("reason {}", full.reason).into_boxed_str(),
+            format!("tests {}", full.tests.len()).into_boxed_str(),
         ]),
         Some(contract::CommandResult::None(none)) => none_summary_lines(none),
         Some(contract::CommandResult::Error(error)) => {
@@ -1157,6 +1158,7 @@ mod tests {
             shared_work: shared_work(),
             result: Some(contract::CommandResult::Full(contract::FullResult {
                 reason: Box::<str>::from("global invalidator changed: tsconfig.json"),
+                tests: Box::from([Box::<str>::from("src/file-a.test.ts")]),
             })),
         };
 

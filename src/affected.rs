@@ -56,7 +56,12 @@ pub enum FullReason {
     /// A deleted source file prevents reliable reverse tracing.
     DeletedSourceFile(roots::RootRelativePath),
     /// A local import could not be resolved safely.
-    UnresolvedLocalImport(roots::RootRelativePath),
+    UnresolvedLocalImport {
+        /// File containing the unresolved import.
+        importer: roots::RootRelativePath,
+        /// Import specifier that could not be resolved.
+        specifier: roots::ImportSpecifier,
+    },
     /// A non-literal dynamic import requires the full suite.
     UnknownDynamicImport(roots::RootRelativePath),
 }
@@ -212,9 +217,13 @@ where
 
 fn full_result_from_graph_error(error: failure::AppError) -> failure::Result<AffectedResult> {
     match error {
-        failure::AppError::UnresolvedLocalImport { importer, .. } => Ok(AffectedResult::Full(
-            FullReason::UnresolvedLocalImport(importer),
-        )),
+        failure::AppError::UnresolvedLocalImport {
+            importer,
+            specifier,
+        } => Ok(AffectedResult::Full(FullReason::UnresolvedLocalImport {
+            importer,
+            specifier,
+        })),
         failure::AppError::UnknownDynamicImport { importer } => Ok(AffectedResult::Full(
             FullReason::UnknownDynamicImport(importer),
         )),
@@ -573,9 +582,10 @@ mod tests {
 
         assert_eq!(
             unresolved_result,
-            super::AffectedResult::Full(super::FullReason::UnresolvedLocalImport(path(
-                "src/file-a.ts"
-            ))),
+            super::AffectedResult::Full(super::FullReason::UnresolvedLocalImport {
+                importer: path("src/file-a.ts"),
+                specifier: roots::ImportSpecifier::try_from("./missing").unwrap(),
+            }),
         );
 
         let dynamic_result = super::select(super::SelectionRequest {

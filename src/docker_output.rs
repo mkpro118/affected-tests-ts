@@ -131,9 +131,12 @@ fn render_result(result: &contract::CommandResult, total_steps: usize) -> Box<st
         contract::CommandResult::Partial(partial) => {
             format!("partial: {}", affected_test_count(partial.tests.len())).into_boxed_str()
         }
-        contract::CommandResult::Full(_full) => {
-            Box::<str>::from("full: run complete bun test suite")
-        }
+        contract::CommandResult::Full(full) => format!(
+            "full: {} ({})",
+            affected_test_count(full.tests.len()),
+            full.reason
+        )
+        .into_boxed_str(),
         contract::CommandResult::None(_none) => Box::<str>::from("none: no affected tests"),
         contract::CommandResult::Error(error) => {
             format!("error {}: {}", error.code, error.message).into_boxed_str()
@@ -248,6 +251,10 @@ mod tests {
             ]),
             result: contract::CommandResult::Full(contract::FullResult {
                 reason: Box::<str>::from("global invalidator changed: tsconfig.json"),
+                tests: Box::from([
+                    Box::<str>::from("src/accounts.test.ts"),
+                    Box::<str>::from("src/button.test.tsx"),
+                ]),
             }),
         };
 
@@ -260,7 +267,9 @@ mod tests {
             Vec::from([
                 Box::<str>::from("=> [discover 1/3] detected changed files: 4 19ms"),
                 Box::<str>::from("=> [resolve  2/3] global invalidator matched: tsconfig.json 2ms",),
-                Box::<str>::from("=> [result   3/3] full: run complete bun test suite"),
+                Box::<str>::from(
+                    "=> [result   3/3] full: 2 affected tests (global invalidator changed: tsconfig.json)"
+                ),
             ])
         );
     }

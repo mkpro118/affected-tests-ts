@@ -17,6 +17,8 @@ pub struct SelectionOutputRequest<'a> {
     pub result: impact::AffectedResult,
     /// Git changes considered by the selection.
     pub changes: &'a vcs::ChangeSet,
+    /// Discovered source and test files.
+    pub files: &'a discovery::Files,
     /// Whether reason chains should be included.
     pub include_reasons: bool,
 }
@@ -38,6 +40,7 @@ pub fn command_result(request: SelectionOutputRequest<'_>) -> contract::CommandR
         impact::AffectedResult::Full(reason) => {
             contract::CommandResult::Full(contract::FullResult {
                 reason: full_reason_text(&reason),
+                tests: path_strings(request.files.tests.as_ref()),
             })
         }
         impact::AffectedResult::None => contract::CommandResult::None(contract::NoneResult {
@@ -130,9 +133,10 @@ fn full_reason_text(reason: &impact::FullReason) -> Box<str> {
         impact::FullReason::DeletedSourceFile(path) => {
             format!("deleted source file: {path}").into_boxed_str()
         }
-        impact::FullReason::UnresolvedLocalImport(path) => {
-            format!("unresolved local import in: {path}").into_boxed_str()
-        }
+        impact::FullReason::UnresolvedLocalImport {
+            importer,
+            specifier,
+        } => format!("unresolved local import `{specifier}` in: {importer}").into_boxed_str(),
         impact::FullReason::UnknownDynamicImport(path) => {
             format!("unknown dynamic import in: {path}").into_boxed_str()
         }
@@ -154,4 +158,52 @@ fn graph_edges(
     }
     edges.sort_by(|left, right| left.from.cmp(&right.from).then(left.to.cmp(&right.to)));
     edges.into_boxed_slice()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::contract;
+    use crate::discovery;
+    use crate::impact;
+    use crate::roots;
+    use crate::vcs;
+
+    fn path(value: &str) -> roots::RootRelativePath {
+        roots::RootRelativePath::try_from(value).unwrap()
+    }
+
+    #[test]
+    fn full_selection_contract_carries_discovered_tests_for_shell_runners() {
+        let changes = vcs::ChangeSet {
+            files: Box::from([vcs::ChangedFile {
+                status: vcs::ChangedFileStatus::Modified,
+                path: path("tsconfig.json"),
+                previous_path: None,
+            }]),
+        };
+        let files = discovery::Files {
+            sources: Box::from([path("src/button.tsx")]),
+            tests: Box::from([path("src/button.test.tsx"), path("src/form.test.ts")]),
+        };
+
+        let result = super::command_result(super::SelectionOutputRequest {
+            result: impact::AffectedResult::Full(impact::FullReason::GlobalInvalidator(path(
+                "tsconfig.json",
+            ))),
+            changes: &changes,
+            files: &files,
+            include_reasons: false,
+        });
+
+        let contract::CommandResult::Full(full) = result else {
+            panic!("expected full result");
+        };
+        assert_eq!(
+            full.tests,
+            Box::from([
+                Box::<str>::from("src/button.test.tsx"),
+                Box::<str>::from("src/form.test.ts"),
+            ]),
+        );
+    }
 }

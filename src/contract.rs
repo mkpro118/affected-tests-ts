@@ -32,6 +32,8 @@ pub struct PartialResult {
 pub struct FullResult {
     /// User-facing fail-closed reason.
     pub reason: Box<str>,
+    /// Stable sorted test paths to run for the full suite.
+    pub tests: Box<[Box<str>]>,
 }
 
 /// Contract emitted when no tests are affected.

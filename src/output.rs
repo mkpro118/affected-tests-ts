@@ -136,7 +136,7 @@ where
 fn render_shell(result: &contract::CommandResult) -> Box<str> {
     match result {
         contract::CommandResult::Partial(partial) => newline_join(partial.tests.as_ref()),
-        contract::CommandResult::Full(_full) => Box::<str>::from(""),
+        contract::CommandResult::Full(full) => newline_join(full.tests.as_ref()),
         contract::CommandResult::None(_none) => Box::<str>::from(""),
         contract::CommandResult::Error(_error) => Box::<str>::from(""),
     }
@@ -153,11 +153,20 @@ fn render_json(result: &contract::CommandResult) -> failure::Result<Box<str>> {
 fn render_plain(result: &contract::CommandResult) -> Box<str> {
     match result {
         contract::CommandResult::Partial(partial) => render_plain_partial(partial),
-        contract::CommandResult::Full(full) => format!("full: {}\n", full.reason).into_boxed_str(),
+        contract::CommandResult::Full(full) => render_plain_full(full),
         contract::CommandResult::None(none) => render_plain_none(none),
         contract::CommandResult::Error(error) => {
             format!("error {}: {}\n", error.code, error.message).into_boxed_str()
         }
+    }
+}
+
+fn render_plain_full(full: &contract::FullResult) -> Box<str> {
+    let tests = newline_join(full.tests.as_ref());
+    if tests.is_empty() {
+        format!("full: {}\n", full.reason).into_boxed_str()
+    } else {
+        format!("full: {}\n{tests}", full.reason).into_boxed_str()
     }
 }
 
@@ -283,6 +292,7 @@ mod tests {
     fn shell_output_emits_only_partial_test_path_lines() {
         let full_result = contract::CommandResult::Full(contract::FullResult {
             reason: Box::<str>::from("global invalidator changed"),
+            tests: Box::from([Box::<str>::from("src/full-suite.test.ts")]),
         });
         let none_result = contract::CommandResult::None(contract::NoneResult {
             changed_files: Box::from([Box::<str>::from("README.md")]),
@@ -292,13 +302,13 @@ mod tests {
             message: Box::<str>::from("invalid configuration"),
         });
 
-        // Shell output is consumed by scripts, so non-path statuses must not
-        // become accidental test paths on stdout.
+        // Shell output is consumed by scripts, so it emits only runnable test
+        // paths and no status text.
         assert_eq!(
             shell_output_for(partial_result()),
             "src/accounts.test.ts\nsrc/button.test.tsx\n"
         );
-        assert_eq!(shell_output_for(full_result), "");
+        assert_eq!(shell_output_for(full_result), "src/full-suite.test.ts\n");
         assert_eq!(shell_output_for(none_result), "");
         assert_eq!(shell_output_for(error_result), "");
     }
