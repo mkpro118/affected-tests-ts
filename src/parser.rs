@@ -2,7 +2,7 @@
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast;
-use oxc_ast_visit::{walk, Visit};
+use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
 use oxc_span::SourceType;
 
@@ -116,18 +116,25 @@ fn collect_static_statement_imports(
     static_specifiers: &mut Vec<roots::ImportSpecifier>,
 ) -> failure::Result<()> {
     match statement {
-        ast::Statement::ImportDeclaration(declaration) => {
+        ast::Statement::ImportDeclaration(declaration) if has_runtime_import(declaration) => {
             push_specifier(static_specifiers, declaration.source.value.as_str())?;
         }
-        ast::Statement::ExportAllDeclaration(declaration) => {
+        ast::Statement::ExportAllDeclaration(declaration)
+            if has_runtime_export_all(declaration) =>
+        {
             push_specifier(static_specifiers, declaration.source.value.as_str())?;
         }
-        ast::Statement::ExportNamedDeclaration(declaration) => {
+        ast::Statement::ExportNamedDeclaration(declaration)
+            if has_runtime_named_export(declaration) =>
+        {
             if let Some(source) = &declaration.source {
                 push_specifier(static_specifiers, source.value.as_str())?;
             }
         }
-        ast::Statement::BlockStatement(_)
+        ast::Statement::ImportDeclaration(_)
+        | ast::Statement::ExportAllDeclaration(_)
+        | ast::Statement::ExportNamedDeclaration(_)
+        | ast::Statement::BlockStatement(_)
         | ast::Statement::BreakStatement(_)
         | ast::Statement::ContinueStatement(_)
         | ast::Statement::DebuggerStatement(_)
@@ -160,6 +167,37 @@ fn collect_static_statement_imports(
     }
 
     Ok(())
+}
+
+fn has_runtime_import(declaration: &ast::ImportDeclaration<'_>) -> bool {
+    if declaration.import_kind == ast::ImportOrExportKind::Type {
+        return false;
+    }
+
+    declaration.specifiers.as_ref().is_none_or(|specifiers| {
+        specifiers.iter().any(|specifier| match specifier {
+            ast::ImportDeclarationSpecifier::ImportSpecifier(named) => {
+                named.import_kind == ast::ImportOrExportKind::Value
+            }
+            ast::ImportDeclarationSpecifier::ImportDefaultSpecifier(_)
+            | ast::ImportDeclarationSpecifier::ImportNamespaceSpecifier(_) => true,
+        })
+    })
+}
+
+fn has_runtime_export_all(declaration: &ast::ExportAllDeclaration<'_>) -> bool {
+    declaration.export_kind == ast::ImportOrExportKind::Value
+}
+
+fn has_runtime_named_export(declaration: &ast::ExportNamedDeclaration<'_>) -> bool {
+    if declaration.export_kind == ast::ImportOrExportKind::Type {
+        return false;
+    }
+
+    declaration
+        .specifiers
+        .iter()
+        .any(|specifier| specifier.export_kind == ast::ImportOrExportKind::Value)
 }
 
 fn push_specifier(
@@ -315,9 +353,15 @@ mod tests {
 
     const MIXED_IMPORTS_SOURCE: &str = r"
 import { AccountCard } from './account-card';
+import { type AccountRole } from './account-role';
+import { AccountForm, type AccountInput } from './account-form';
 import './register-locale';
 export { accountRoutes } from './routes';
+export { type AccountView } from './account-view';
+export { accountColumns, type AccountColumn } from './account-columns';
 import type { Account } from './types';
+export type { AccountSettings } from './settings';
+export type * from './type-barrel';
 const lazyPanel = import('./lazy-panel');
 ";
 
@@ -527,17 +571,18 @@ declare namespace AppTypes {
             path: path("src/accounts/index.ts"),
         };
 
-        // The fixture intentionally mixes import forms common in TS apps so the
-        // parser contract documents the graph edges V1 must preserve.
+        // Type-only imports can affect TypeScript checking, but they do not
+        // represent runtime execution paths for affected-test selection.
         let imports = super::imports(request).unwrap();
 
         assert_eq!(
             imports.static_specifiers,
             Box::<[roots::ImportSpecifier]>::from([
                 specifier("./account-card"),
+                specifier("./account-form"),
                 specifier("./register-locale"),
                 specifier("./routes"),
-                specifier("./types"),
+                specifier("./account-columns"),
             ]),
         );
         assert_eq!(
@@ -1020,12 +1065,13 @@ declare namespace AppTypes {
         };
 
         // Large declaration files can contain ambient forms Oxc diagnoses while
-        // still producing an AST with the imports needed for graph edges.
+        // still producing an AST. Type-only declarations do not create runtime
+        // affected-test edges.
         let imports = super::imports(request).unwrap();
 
         assert_eq!(
             imports.static_specifiers,
-            Box::<[roots::ImportSpecifier]>::from([specifier("./account")]),
+            Box::<[roots::ImportSpecifier]>::from([]),
         );
     }
 }
