@@ -132,6 +132,9 @@ fn commit_fixture_change(repository_path: &path::Path, message: &str) {
         .env("GIT_AUTHOR_EMAIL", "fixtures@example.invalid")
         .env("GIT_COMMITTER_NAME", "Affected Tests Fixture")
         .env("GIT_COMMITTER_EMAIL", "fixtures@example.invalid")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
+        .env("GIT_CONFIG_VALUE_0", "false")
         .output()
         .unwrap();
 
@@ -455,6 +458,32 @@ fn binary_run_from_monorepo_workspace_emits_workspace_relative_paths() {
     assert_monorepo_selection_outputs(&outputs);
     assert_monorepo_graph_output(&outputs.graph);
     assert_monorepo_metadata_outputs(&outputs);
+}
+
+#[test]
+fn worktree_mode_includes_uncommitted_changes() {
+    let fixture_repo = create_fixture_repo("worktree-dirty");
+    write_fixture_file(&WriteFixtureFileRequest {
+        repository_path: &fixture_repo,
+        relative_path: "src/value.ts",
+        content: "export const value = 42;\n",
+    });
+
+    let default_output = run_affected_tests(CommandRequest {
+        repository_path: &fixture_repo,
+        args: &["--base", "origin/main", "--head", "HEAD"],
+    });
+    let worktree_output = run_affected_tests(CommandRequest {
+        repository_path: &fixture_repo,
+        args: &["--base", "origin/main", "--head", "HEAD", "--worktree"],
+    });
+
+    // The default command stays revision-based. --worktree explicitly adds the
+    // dirty tracked file diff against HEAD.
+    assert_success(&default_output);
+    assert_success(&worktree_output);
+    assert_eq!(stdout(&default_output), "");
+    assert_eq!(stdout(&worktree_output), "tests/value.test.ts\n");
 }
 
 #[test]

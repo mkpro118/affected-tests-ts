@@ -37,6 +37,7 @@ pub struct Request {
 struct SelectionCommand {
     base: Box<str>,
     head: Box<str>,
+    worktree: bool,
     format: presentation::Format,
     include_reasons: bool,
     terminal_mode: TerminalMode,
@@ -99,6 +100,7 @@ pub fn run_with(request: Request) -> failure::Result<()> {
                 .head
                 .clone()
                 .unwrap_or_else(|| Box::<str>::from("HEAD")),
+            worktree: args.worktree,
             format: app_render::format(args.format),
             include_reasons: args.explain,
             terminal_mode,
@@ -108,17 +110,15 @@ pub fn run_with(request: Request) -> failure::Result<()> {
 
 fn run_selection(request: SelectionCommand) -> failure::Result<()> {
     let repository_path = repository_root()?;
+    let repository = vcs::ProcessRepository::for_root(repository_path.clone());
     let changes = vcs::changed_files(vcs::ChangesRequest {
         repository: repository.clone(),
-    let repository = vcs::ProcessRepository::for_root(repository_path.clone());
         base: request.base.clone(),
         head: request.head.clone(),
+        worktree: request.worktree,
     })?;
     let pipeline = app_pipeline::build(repository_path)?;
     let classifier = app_pipeline::Classifier::try_new(&pipeline.config)?;
-    let result = impact::select(impact::SelectionRequest {
-        graph: pipeline.graph,
-        classifier,
     let selection_changes = match &pipeline.graph {
         Ok(graph) => package_scope::scoped_changes(&package_scope::ScopeRequest {
             repository: &repository,
@@ -129,6 +129,9 @@ fn run_selection(request: SelectionCommand) -> failure::Result<()> {
         })?,
         Err(_error) => changes,
     };
+    let result = impact::select(impact::SelectionRequest {
+        graph: pipeline.graph,
+        classifier,
         always_run: app_pipeline::EmptyAlwaysRun::default(),
         changes: selection_changes.clone(),
     })?;
@@ -186,10 +189,10 @@ fn run_explain(request: ExplainCommand) -> failure::Result<()> {
     let contract = app_contract::command_result(app_contract::SelectionOutputRequest {
         result,
         changes: &changes,
+        files: &pipeline.files,
         include_reasons: true,
     });
 
-        files: &pipeline.files,
     app_render::render(app_render::Command {
         format: request.format,
         result: contract,

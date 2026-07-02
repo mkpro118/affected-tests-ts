@@ -18,6 +18,9 @@ pub struct Args {
     /// Git head revision used for changed-file detection.
     #[arg(long, global = true)]
     pub head: Option<Box<str>>,
+    /// Include staged, unstaged, and untracked worktree changes.
+    #[arg(long, global = true)]
+    pub worktree: bool,
     /// Include explain reason chains in formats that support them.
     #[arg(long)]
     pub explain: bool,

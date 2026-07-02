@@ -234,6 +234,8 @@ pub struct ChangesRequest<R> {
     pub base: Box<str>,
     /// Head revision for three-dot diff.
     pub head: Box<str>,
+    /// Include staged, unstaged, and untracked worktree changes.
+    pub worktree: bool,
 }
 
 /// Detects typed changed files from Git.
@@ -249,10 +251,28 @@ where
         repository,
         base,
         head,
+        worktree,
     } = request;
     let output = repository.diff_name_status(&DiffRequest { base, head })?;
     let mut files = Vec::<ChangedFile>::new();
+    push_name_status_files(&mut files, output.as_ref())?;
+    if worktree {
+        let worktree_output = repository.diff_worktree_name_status()?;
+        push_name_status_files(&mut files, worktree_output.as_ref())?;
+        let untracked_output = repository.untracked_files()?;
+        push_untracked_files(&mut files, untracked_output.as_ref())?;
+    }
 
+    files.sort_by(compare_changed_files);
+    files.dedup_by(|left, right| {
+        left.path == right.path && left.previous_path == right.previous_path
+    });
+    Ok(ChangeSet {
+        files: files.into_boxed_slice(),
+    })
+}
+
+fn push_name_status_files(files: &mut Vec<ChangedFile>, output: &str) -> failure::Result<()> {
     for line in output.lines() {
         if line.is_empty() {
             continue;
@@ -260,10 +280,22 @@ where
         files.push(changed_file_from_line(line)?);
     }
 
-    files.sort_by(compare_changed_files);
-    Ok(ChangeSet {
-        files: files.into_boxed_slice(),
-    })
+    Ok(())
+}
+
+fn push_untracked_files(files: &mut Vec<ChangedFile>, output: &str) -> failure::Result<()> {
+    for line in output.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        files.push(ChangedFile {
+            status: ChangedFileStatus::Added,
+            path: roots::RootRelativePath::try_from(line)?,
+            previous_path: None,
+        });
+    }
+
+    Ok(())
 }
 
 fn changed_file_from_line(line: &str) -> failure::Result<ChangedFile> {
@@ -346,46 +378,14 @@ mod tests {
     #[derive(Clone, Debug)]
     struct FixtureRepository {
         output: Box<str>,
+        worktree_output: Box<str>,
+        untracked_output: Box<str>,
     }
 
     impl super::GitRepository for FixtureRepository {
         fn diff_name_status(&self, _request: &super::DiffRequest) -> failure::Result<Box<str>> {
             Ok(self.output.clone())
         }
-    }
-
-    fn path(value: &str) -> roots::RootRelativePath {
-        roots::RootRelativePath::try_from(value).unwrap()
-    }
-
-    #[test]
-    fn parses_name_status_records_for_modified_renamed_and_deleted_paths() {
-        let result = super::changed_files(super::ChangesRequest {
-            repository: FixtureRepository {
-                output: Box::<str>::from(
-                    "R100\tsrc/old.ts\tsrc/new.ts\nD\tsrc/removed.ts\nM\tsrc/value.ts\n",
-                ),
-            },
-            base: Box::<str>::from("origin/main"),
-            head: Box::<str>::from("HEAD"),
-        })
-        .unwrap();
-
-        // This fixture mirrors real `git diff --name-status --find-renames`
-        // output so parsing stays isolated from process execution.
-        assert_eq!(
-            result.files,
-            Box::from([
-                super::ChangedFile {
-                    status: super::ChangedFileStatus::Renamed,
-        worktree_output: Box<str>,
-        untracked_output: Box<str>,
-                    path: path("src/new.ts"),
-                    previous_path: Some(path("src/old.ts")),
-                },
-                super::ChangedFile {
-                    status: super::ChangedFileStatus::Deleted,
-                    path: path("src/removed.ts"),
 
         fn diff_worktree_name_status(&self) -> failure::Result<Box<str>> {
             Ok(self.worktree_output.clone())
@@ -402,6 +402,41 @@ mod tests {
         ) -> failure::Result<Option<Box<str>>> {
             Ok(None)
         }
+    }
+
+    fn path(value: &str) -> roots::RootRelativePath {
+        roots::RootRelativePath::try_from(value).unwrap()
+    }
+
+    #[test]
+    fn parses_name_status_records_for_modified_renamed_and_deleted_paths() {
+        let result = super::changed_files(super::ChangesRequest {
+            repository: FixtureRepository {
+                output: Box::<str>::from(
+                    "R100\tsrc/old.ts\tsrc/new.ts\nD\tsrc/removed.ts\nM\tsrc/value.ts\n",
+                ),
+                worktree_output: Box::<str>::from(""),
+                untracked_output: Box::<str>::from(""),
+            },
+            base: Box::<str>::from("origin/main"),
+            head: Box::<str>::from("HEAD"),
+            worktree: false,
+        })
+        .unwrap();
+
+        // This fixture mirrors real `git diff --name-status --find-renames`
+        // output so parsing stays isolated from process execution.
+        assert_eq!(
+            result.files,
+            Box::from([
+                super::ChangedFile {
+                    status: super::ChangedFileStatus::Renamed,
+                    path: path("src/new.ts"),
+                    previous_path: Some(path("src/old.ts")),
+                },
+                super::ChangedFile {
+                    status: super::ChangedFileStatus::Deleted,
+                    path: path("src/removed.ts"),
                     previous_path: None,
                 },
                 super::ChangedFile {
@@ -412,6 +447,45 @@ mod tests {
             ]),
         );
     }
+
+    #[test]
+    fn worktree_mode_combines_committed_tracked_and_untracked_changes() {
+        let result = super::changed_files(super::ChangesRequest {
+            repository: FixtureRepository {
+                output: Box::<str>::from("M\tsrc/committed.ts\n"),
+                worktree_output: Box::<str>::from("M\tsrc/dirty.ts\nD\tsrc/deleted.ts\n"),
+                untracked_output: Box::<str>::from("src/new.test.ts\n"),
+            },
+            base: Box::<str>::from("origin/main"),
+            head: Box::<str>::from("HEAD"),
+            worktree: true,
+        })
+        .unwrap();
+
+        assert_eq!(
+            result.files,
+            Box::from([
+                super::ChangedFile {
+                    status: super::ChangedFileStatus::Modified,
+                    path: path("src/committed.ts"),
+                    previous_path: None,
+                },
+                super::ChangedFile {
+                    status: super::ChangedFileStatus::Deleted,
+                    path: path("src/deleted.ts"),
+                    previous_path: None,
+                },
+                super::ChangedFile {
+                    status: super::ChangedFileStatus::Modified,
+                    path: path("src/dirty.ts"),
+                    previous_path: None,
+                },
+                super::ChangedFile {
+                    status: super::ChangedFileStatus::Added,
+                    path: path("src/new.test.ts"),
+                    previous_path: None,
+                },
+            ]),
+        );
+    }
 }
-                worktree_output: Box::<str>::from(""),
-                untracked_output: Box::<str>::from(""),
