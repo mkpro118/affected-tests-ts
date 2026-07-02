@@ -62,6 +62,31 @@ pub trait GitRepository {
     ///
     /// Returns an error when Git cannot compute the requested range.
     fn diff_name_status(&self, request: &DiffRequest) -> failure::Result<Box<str>>;
+
+    /// Runs Git diff name-status for staged and unstaged tracked worktree changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Git cannot compute the worktree diff.
+    fn diff_worktree_name_status(&self) -> failure::Result<Box<str>>;
+
+    /// Lists untracked files visible from the invocation workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Git cannot list untracked files.
+    fn untracked_files(&self) -> failure::Result<Box<str>>;
+
+    /// Reads a UTF-8 file at a Git revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Git cannot read an existing file.
+    fn file_at_revision(
+        &self,
+        revision: &str,
+        path: &roots::RootRelativePath,
+    ) -> failure::Result<Option<Box<str>>>;
 }
 
 /// Process-backed repository adapter for real Git invocations.
@@ -105,6 +130,90 @@ impl GitRepository for ProcessRepository {
             .map(String::into_boxed_str)
             .map_err(|error| failure::AppError::Git {
                 message: format!("git diff output was not UTF-8: {error}").into_boxed_str(),
+            })
+    }
+
+    fn diff_worktree_name_status(&self) -> failure::Result<Box<str>> {
+        let output = process::Command::new("git")
+            .arg("-C")
+            .arg(path::Path::new(self.working_directory.as_ref()))
+            .arg("diff")
+            .arg("--name-status")
+            .arg("--relative")
+            .arg("--find-renames")
+            .arg("--diff-filter=ACMRTD")
+            .arg("HEAD")
+            .output()
+            .map_err(|error| failure::AppError::Git {
+                message: format!("failed to execute git worktree diff: {error}").into_boxed_str(),
+            })?;
+
+        if !output.status.success() {
+            return Err(failure::AppError::Git {
+                message: git_failure_message(output.stderr.as_slice()),
+            });
+        }
+
+        String::from_utf8(output.stdout)
+            .map(String::into_boxed_str)
+            .map_err(|error| failure::AppError::Git {
+                message: format!("git worktree diff output was not UTF-8: {error}")
+                    .into_boxed_str(),
+            })
+    }
+
+    fn untracked_files(&self) -> failure::Result<Box<str>> {
+        let output = process::Command::new("git")
+            .arg("-C")
+            .arg(path::Path::new(self.working_directory.as_ref()))
+            .arg("ls-files")
+            .arg("--others")
+            .arg("--exclude-standard")
+            .arg("--")
+            .arg(".")
+            .output()
+            .map_err(|error| failure::AppError::Git {
+                message: format!("failed to execute git ls-files: {error}").into_boxed_str(),
+            })?;
+
+        if !output.status.success() {
+            return Err(failure::AppError::Git {
+                message: git_failure_message(output.stderr.as_slice()),
+            });
+        }
+
+        String::from_utf8(output.stdout)
+            .map(String::into_boxed_str)
+            .map_err(|error| failure::AppError::Git {
+                message: format!("git ls-files output was not UTF-8: {error}").into_boxed_str(),
+            })
+    }
+
+    fn file_at_revision(
+        &self,
+        revision: &str,
+        path: &roots::RootRelativePath,
+    ) -> failure::Result<Option<Box<str>>> {
+        let object = format!("{revision}:{}", path.as_str());
+        let output = process::Command::new("git")
+            .arg("-C")
+            .arg(path::Path::new(self.working_directory.as_ref()))
+            .arg("show")
+            .arg(object)
+            .output()
+            .map_err(|error| failure::AppError::Git {
+                message: format!("failed to execute git show: {error}").into_boxed_str(),
+            })?;
+
+        if !output.status.success() {
+            return Ok(None);
+        }
+
+        String::from_utf8(output.stdout)
+            .map(String::into_boxed_str)
+            .map(Some)
+            .map_err(|error| failure::AppError::Git {
+                message: format!("git show output was not UTF-8: {error}").into_boxed_str(),
             })
     }
 }
@@ -269,12 +378,30 @@ mod tests {
             Box::from([
                 super::ChangedFile {
                     status: super::ChangedFileStatus::Renamed,
+        worktree_output: Box<str>,
+        untracked_output: Box<str>,
                     path: path("src/new.ts"),
                     previous_path: Some(path("src/old.ts")),
                 },
                 super::ChangedFile {
                     status: super::ChangedFileStatus::Deleted,
                     path: path("src/removed.ts"),
+
+        fn diff_worktree_name_status(&self) -> failure::Result<Box<str>> {
+            Ok(self.worktree_output.clone())
+        }
+
+        fn untracked_files(&self) -> failure::Result<Box<str>> {
+            Ok(self.untracked_output.clone())
+        }
+
+        fn file_at_revision(
+            &self,
+            _revision: &str,
+            _path: &roots::RootRelativePath,
+        ) -> failure::Result<Option<Box<str>>> {
+            Ok(None)
+        }
                     previous_path: None,
                 },
                 super::ChangedFile {
@@ -286,3 +413,5 @@ mod tests {
         );
     }
 }
+                worktree_output: Box::<str>::from(""),
+                untracked_output: Box::<str>::from(""),

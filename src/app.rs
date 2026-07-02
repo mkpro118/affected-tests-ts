@@ -11,6 +11,7 @@ use crate::app_render;
 use crate::cli;
 use crate::failure;
 use crate::impact;
+use crate::package_scope;
 use crate::presentation;
 use crate::roots;
 use crate::vcs;
@@ -108,7 +109,8 @@ pub fn run_with(request: Request) -> failure::Result<()> {
 fn run_selection(request: SelectionCommand) -> failure::Result<()> {
     let repository_path = repository_root()?;
     let changes = vcs::changed_files(vcs::ChangesRequest {
-        repository: vcs::ProcessRepository::for_root(repository_path.clone()),
+        repository: repository.clone(),
+    let repository = vcs::ProcessRepository::for_root(repository_path.clone());
         base: request.base.clone(),
         head: request.head.clone(),
     })?;
@@ -117,12 +119,22 @@ fn run_selection(request: SelectionCommand) -> failure::Result<()> {
     let result = impact::select(impact::SelectionRequest {
         graph: pipeline.graph,
         classifier,
+    let selection_changes = match &pipeline.graph {
+        Ok(graph) => package_scope::scoped_changes(&package_scope::ScopeRequest {
+            repository: &repository,
+            base: request.base.as_ref(),
+            head: request.head.as_ref(),
+            changes: &changes,
+            graph,
+        })?,
+        Err(_error) => changes,
+    };
         always_run: app_pipeline::EmptyAlwaysRun::default(),
-        changes: changes.clone(),
+        changes: selection_changes.clone(),
     })?;
     let contract = app_contract::command_result(app_contract::SelectionOutputRequest {
         result,
-        changes: &changes,
+        changes: &selection_changes,
         files: &pipeline.files,
         include_reasons: request.include_reasons,
     });
@@ -133,7 +145,7 @@ fn run_selection(request: SelectionCommand) -> failure::Result<()> {
         terminal_mode: request.terminal_mode,
         base: request.base,
         head: request.head,
-        changed_file_count: changes.files().len(),
+        changed_file_count: selection_changes.files().len(),
     })
 }
 
@@ -173,11 +185,11 @@ fn run_explain(request: ExplainCommand) -> failure::Result<()> {
     })?;
     let contract = app_contract::command_result(app_contract::SelectionOutputRequest {
         result,
-        files: &pipeline.files,
         changes: &changes,
         include_reasons: true,
     });
 
+        files: &pipeline.files,
     app_render::render(app_render::Command {
         format: request.format,
         result: contract,

@@ -580,6 +580,7 @@ fn default_test_pattern_values() -> Box<[Box<str>]> {
 fn default_global_invalidator_values() -> Box<[Box<str>]> {
     Box::from([
         Box::<str>::from("package.json"),
+        Box::<str>::from("bun.lock"),
         Box::<str>::from("bun.lockb"),
         Box::<str>::from("tsconfig.json"),
     ])
@@ -652,6 +653,7 @@ mod tests {
             pattern_values(super::View::global_invalidators(&config)),
             Box::<[Box<str>]>::from([
                 Box::<str>::from("package.json"),
+                Box::<str>::from("bun.lock"),
                 Box::<str>::from("bun.lockb"),
                 Box::<str>::from("tsconfig.json"),
             ]),

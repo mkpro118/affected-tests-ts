@@ -27,6 +27,7 @@ pub mod impact;
 pub mod logs;
 #[path = "resolve.rs"]
 pub mod modules;
+mod package_scope;
 pub mod parser;
 #[path = "output.rs"]
 pub mod presentation;

@@ -19,19 +19,29 @@ pub trait GraphView {
     /// Returns direct dependencies for a graph node in stable order.
     #[must_use]
     fn dependencies(&self, path: &roots::RootRelativePath) -> &[roots::RootRelativePath];
+
+    /// Returns files that import an external package in stable order.
+    #[must_use]
+    fn external_importers(&self, package: &str) -> &[roots::RootRelativePath];
 }
 
 /// Import source used by graph construction.
 pub trait ImportResolver {
-    /// Returns resolved dependencies for a file in stable order.
+    /// Returns resolved import edges for a file in stable order.
     ///
     /// # Errors
     ///
     /// Returns an error when imports cannot be parsed or resolved.
-    fn dependencies_for(
-        &self,
-        path: &roots::RootRelativePath,
-    ) -> failure::Result<Box<[roots::RootRelativePath]>>;
+    fn imports_for(&self, path: &roots::RootRelativePath) -> failure::Result<ResolvedImports>;
+}
+
+/// Resolved local and external import edges for one file.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ResolvedImports {
+    /// Local root-relative files imported by a source or test file.
+    pub dependencies: Box<[roots::RootRelativePath]>,
+    /// External package names imported by a source or test file.
+    pub external_packages: Box<[Box<str>]>,
 }
 
 /// Request object for parser and module resolver backed import extraction.
@@ -95,10 +105,7 @@ where
     M: Clone + modules::ImportResolver,
     P: Clone + modules::FileExistence,
 {
-    fn dependencies_for(
-        &self,
-        path: &roots::RootRelativePath,
-    ) -> failure::Result<Box<[roots::RootRelativePath]>> {
+    fn imports_for(&self, path: &roots::RootRelativePath) -> failure::Result<ResolvedImports> {
         let imports = parser::imports(parser::Request {
             reader: self.reader.clone(),
             path: path.clone(),
@@ -139,6 +146,7 @@ pub struct GraphBuildRequest<I> {
 pub struct DependencyGraph {
     dependencies: BTreeMap<roots::RootRelativePath, Box<[roots::RootRelativePath]>>,
     reverse_dependencies: BTreeMap<roots::RootRelativePath, Box<[roots::RootRelativePath]>>,
+    external_importers: BTreeMap<Box<str>, Box<[roots::RootRelativePath]>>,
     empty: Box<[roots::RootRelativePath]>,
 }
 
@@ -152,6 +160,12 @@ impl GraphView for DependencyGraph {
     fn dependencies(&self, path: &roots::RootRelativePath) -> &[roots::RootRelativePath] {
         self.dependencies
             .get(path)
+            .map_or_else(|| self.empty.as_ref(), Box::as_ref)
+    }
+
+    fn external_importers(&self, package: &str) -> &[roots::RootRelativePath] {
+        self.external_importers
+            .get(package)
             .map_or_else(|| self.empty.as_ref(), Box::as_ref)
     }
 }
@@ -188,6 +202,7 @@ struct ResolveImportsRequest<C, M, P> {
 struct NodeEdges {
     path: roots::RootRelativePath,
     dependencies: Box<[roots::RootRelativePath]>,
+    external_packages: Box<[Box<str>]>,
 }
 
 struct DynamicImportFailureRequest<'a, C> {
@@ -207,7 +222,7 @@ where
 
 fn resolve_imports<C, M, P>(
     request: ResolveImportsRequest<C, M, P>,
-) -> failure::Result<Box<[roots::RootRelativePath]>>
+) -> failure::Result<ResolvedImports>
 where
     C: Clone + settings::View,
     M: Clone + modules::ImportResolver,
@@ -223,6 +238,7 @@ where
         failure_mode,
     } = request;
     let mut dependencies = Vec::<roots::RootRelativePath>::new();
+    let mut external_packages = Vec::<Box<str>>::new();
     for specifier in static_specifiers
         .into_vec()
         .into_iter()
@@ -237,7 +253,11 @@ where
 
         match outcome {
             modules::Outcome::Resolved(path) => dependencies.push(path),
-            modules::Outcome::External(_specifier) => {}
+            modules::Outcome::External(specifier) => {
+                if let Some(package) = external_package_name(specifier.as_str()) {
+                    external_packages.push(package);
+                }
+            }
             modules::Outcome::Unresolved(specifier) => {
                 if failure_mode == ImportFailureMode::Strict {
                     return Err(failure::AppError::UnresolvedLocalImport {
@@ -249,15 +269,40 @@ where
         }
     }
 
-    Ok(sorted_unique(dependencies))
+    Ok(ResolvedImports {
+        dependencies: sorted_unique(dependencies),
+        external_packages: sorted_unique(external_packages),
+    })
+}
+
+fn external_package_name(specifier: &str) -> Option<Box<str>> {
+    if specifier.starts_with('.') || specifier.starts_with('/') {
+        return None;
+    }
+
+    let mut segments = specifier.split('/');
+    let first = segments.next()?;
+    if first.is_empty() || first == "src" || first == "~" {
+        return None;
+    }
+    if first.starts_with('@') {
+        return segments
+            .next()
+            .filter(|second| !second.is_empty())
+            .map(|second| format!("{first}/{second}").into_boxed_str());
+    }
+
+    Some(Box::<str>::from(first))
 }
 
 fn node_edges<I>(imports: &I, path: roots::RootRelativePath) -> failure::Result<NodeEdges>
 where
     I: ImportResolver,
 {
+    let imports = imports.imports_for(&path)?;
     Ok(NodeEdges {
-        dependencies: imports.dependencies_for(&path)?,
+        dependencies: imports.dependencies,
+        external_packages: imports.external_packages,
         path,
     })
 }
@@ -267,9 +312,16 @@ fn graph_from_edges(edge_sets: Vec<NodeEdges>) -> DependencyGraph {
         BTreeMap::<roots::RootRelativePath, Box<[roots::RootRelativePath]>>::new();
     let mut reverse_edges =
         BTreeMap::<roots::RootRelativePath, Vec<roots::RootRelativePath>>::new();
+    let mut external_importers = BTreeMap::<Box<str>, Vec<roots::RootRelativePath>>::new();
 
     for edge_set in edge_sets {
         reverse_edges.entry(edge_set.path.clone()).or_default();
+        for package in &edge_set.external_packages {
+            external_importers
+                .entry(package.clone())
+                .or_default()
+                .push(edge_set.path.clone());
+        }
         for dependency in &edge_set.dependencies {
             reverse_edges
                 .entry(dependency.clone())
@@ -286,18 +338,26 @@ fn graph_from_edges(edge_sets: Vec<NodeEdges>) -> DependencyGraph {
         .into_iter()
         .map(|(path, dependents)| (path, sorted_unique(dependents)))
         .collect();
+    let external_importers = external_importers
+        .into_iter()
+        .map(|(package, importers)| (package, sorted_unique(importers)))
+        .collect();
 
     DependencyGraph {
         dependencies,
         reverse_dependencies,
+        external_importers,
         empty: Box::from([]),
     }
 }
 
-fn sorted_unique(mut paths: Vec<roots::RootRelativePath>) -> Box<[roots::RootRelativePath]> {
-    paths.sort();
-    paths.dedup();
-    paths.into_boxed_slice()
+fn sorted_unique<T>(mut values: Vec<T>) -> Box<[T]>
+where
+    T: Ord,
+{
+    values.sort();
+    values.dedup();
+    values.into_boxed_slice()
 }
 
 #[cfg(test)]
@@ -313,18 +373,25 @@ mod tests {
     #[derive(Clone, Debug)]
     struct FixtureImports {
         edges: BTreeMap<roots::RootRelativePath, Box<[roots::RootRelativePath]>>,
+        external_edges: BTreeMap<roots::RootRelativePath, Box<[Box<str>]>>,
         empty: Box<[roots::RootRelativePath]>,
     }
 
     impl super::ImportResolver for FixtureImports {
-        fn dependencies_for(
+        fn imports_for(
             &self,
             path: &roots::RootRelativePath,
-        ) -> failure::Result<Box<[roots::RootRelativePath]>> {
-            Ok(self
-                .edges
-                .get(path)
-                .map_or_else(|| self.empty.clone(), Clone::clone))
+        ) -> failure::Result<super::ResolvedImports> {
+            Ok(super::ResolvedImports {
+                dependencies: self
+                    .edges
+                    .get(path)
+                    .map_or_else(|| self.empty.clone(), Clone::clone),
+                external_packages: self
+                    .external_edges
+                    .get(path)
+                    .map_or_else(|| Box::<[Box<str>]>::from([]), Clone::clone),
+            })
         }
     }
 
@@ -381,6 +448,10 @@ mod tests {
         let file_b = path("src/file-b.ts");
         let imports = FixtureImports {
             edges: BTreeMap::from([(file_a.clone(), Box::from([file_b.clone()]))]),
+            external_edges: BTreeMap::from([(
+                file_a.clone(),
+                Box::from([Box::<str>::from("react")]),
+            )]),
             empty: Box::from([]),
         };
         let request = super::GraphBuildRequest {
@@ -398,6 +469,10 @@ mod tests {
         );
         assert_eq!(
             super::GraphView::reverse_dependents(&graph, &file_b),
+            std::slice::from_ref(&file_a)
+        );
+        assert_eq!(
+            super::GraphView::external_importers(&graph, "react"),
             &[file_a]
         );
     }
@@ -425,12 +500,45 @@ mod tests {
 
         // The fixture exercises the production parser and resolver path without
         // touching host files, proving graph build can consume real source text.
-        let dependencies =
-            super::ImportResolver::dependencies_for(&imports, &path("src/pages/home.ts")).unwrap();
+        let import_edges =
+            super::ImportResolver::imports_for(&imports, &path("src/pages/home.ts")).unwrap();
 
         assert_eq!(
-            dependencies,
+            import_edges.dependencies,
             Box::<[roots::RootRelativePath]>::from([path("src/components/button.ts")]),
+        );
+        assert_eq!(import_edges.external_packages, Box::<[Box<str>]>::from([]));
+    }
+
+    #[test]
+    fn parser_and_resolver_backed_imports_record_external_package_names() {
+        let file_system = vfs::VirtualFileSystem::with_files(Box::from([(
+            path("src/pages/home.ts"),
+            Box::<str>::from(
+                "import React from 'react';\nimport { z } from 'zod/v4';\nimport { Button } from '@radix-ui/react-button';",
+            ),
+        )]));
+        let imports = super::LocalImports::new(super::LocalImportsRequest {
+            config: FixtureConfig {
+                dynamic_imports: settings::UnknownDynamicImportBehavior::FailClosed,
+            },
+            reader: file_system.clone(),
+            resolver: FixtureResolver,
+            probe: file_system,
+        });
+
+        // External imports are normalized to package roots so lockfile changes
+        // can be scoped back to local importer files.
+        let import_edges =
+            super::ImportResolver::imports_for(&imports, &path("src/pages/home.ts")).unwrap();
+
+        assert_eq!(
+            import_edges.external_packages,
+            Box::<[Box<str>]>::from([
+                Box::<str>::from("@radix-ui/react-button"),
+                Box::<str>::from("react"),
+                Box::<str>::from("zod"),
+            ]),
         );
     }
 
@@ -452,7 +560,7 @@ mod tests {
         // Non-literal dynamic imports cannot safely become partial graph edges,
         // so the graph boundary must force callers into full-suite behavior.
         let error =
-            super::ImportResolver::dependencies_for(&imports, &path("src/router.ts")).unwrap_err();
+            super::ImportResolver::imports_for(&imports, &path("src/router.ts")).unwrap_err();
 
         assert!(matches!(
             error,
@@ -485,11 +593,11 @@ mod tests {
 
         // Graph inspection should remain useful even when selection will fail
         // closed for unsupported dynamic or unresolved local imports.
-        let dependencies =
-            super::ImportResolver::dependencies_for(&imports, &path("src/router.ts")).unwrap();
+        let import_edges =
+            super::ImportResolver::imports_for(&imports, &path("src/router.ts")).unwrap();
 
         assert_eq!(
-            dependencies,
+            import_edges.dependencies,
             Box::<[roots::RootRelativePath]>::from([path("src/routes.ts")]),
         );
     }
@@ -511,8 +619,8 @@ mod tests {
 
         // An unresolved relative import means the dependency graph is incomplete;
         // failing closed avoids returning a misleading partial result.
-        let error = super::ImportResolver::dependencies_for(&imports, &path("src/pages/home.ts"))
-            .unwrap_err();
+        let error =
+            super::ImportResolver::imports_for(&imports, &path("src/pages/home.ts")).unwrap_err();
 
         assert!(matches!(
             error,
