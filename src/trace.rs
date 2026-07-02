@@ -284,7 +284,7 @@ where
                 .send(TraceEvent::JoinedInFlight(waiting_path.clone()));
             wait_for_path(WaitRequest {
                 memo: context.memo,
-                waiter: ancestors.last().cloned(),
+                waiter: ancestors.first().cloned(),
                 path: waiting_path,
             })
         }
@@ -326,7 +326,8 @@ where
     }
 
     let child_ancestors = extend_ancestors(ancestors.as_ref(), &path);
-    for dependent in context.graph.reverse_dependents(&path) {
+    let dependents = context.graph.reverse_dependents(&path);
+    for dependent in dependents {
         if ancestors.contains(dependent) {
             let cycle_edge = CycleEdge {
                 from: path.clone(),
@@ -667,6 +668,69 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug)]
+    struct CrossRootCycleGraph {
+        reverse_edges: BTreeMap<roots::RootRelativePath, Box<[roots::RootRelativePath]>>,
+        empty: Box<[roots::RootRelativePath]>,
+        gate: CrossRootCycleGate,
+    }
+
+    impl super::GraphView for CrossRootCycleGraph {
+        fn reverse_dependents(&self, path: &roots::RootRelativePath) -> &[roots::RootRelativePath] {
+            self.gate.observe_graph_path(path);
+            self.reverse_edges
+                .get(path)
+                .map_or_else(|| self.empty.as_ref(), Box::as_ref)
+        }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct CrossRootCycleGate {
+        state: Arc<(Mutex<CrossRootCycleState>, Condvar)>,
+    }
+
+    impl CrossRootCycleGate {
+        fn observe_graph_path(&self, path: &roots::RootRelativePath) {
+            match path.as_str() {
+                "root-a.ts" => self.mark_root_a_observed(),
+                "root-b.ts" => self.mark_root_b_observed(),
+                _ => return,
+            }
+            self.wait_for_both_roots_observed();
+        }
+
+        fn mark_root_a_observed(&self) {
+            let (state, completed) = self.state.as_ref();
+            let mut cycle_state = state.lock().unwrap();
+            cycle_state.root_a_observed = true;
+            drop(cycle_state);
+            completed.notify_all();
+        }
+
+        fn mark_root_b_observed(&self) {
+            let (state, completed) = self.state.as_ref();
+            let mut cycle_state = state.lock().unwrap();
+            cycle_state.root_b_observed = true;
+            drop(cycle_state);
+            completed.notify_all();
+        }
+
+        fn wait_for_both_roots_observed(&self) {
+            let (state, completed) = self.state.as_ref();
+            let mut cycle_state = state.lock().unwrap();
+            while !cycle_state.root_a_observed || !cycle_state.root_b_observed {
+                cycle_state = completed.wait(cycle_state).unwrap();
+            }
+            drop(cycle_state);
+        }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct CrossRootCycleState {
+        root_a_observed: bool,
+        root_b_observed: bool,
+    }
+
     #[derive(Clone, Debug, Default)]
     struct JoinGate {
         state: Arc<(Mutex<JoinState>, Condvar)>,
@@ -796,6 +860,17 @@ mod tests {
         }
     }
 
+    fn cross_root_cycle_graph(
+        reverse_edges: BTreeMap<roots::RootRelativePath, Box<[roots::RootRelativePath]>>,
+        gate: CrossRootCycleGate,
+    ) -> CrossRootCycleGraph {
+        CrossRootCycleGraph {
+            reverse_edges,
+            empty: Box::from([]),
+            gate,
+        }
+    }
+
     fn record_trace_count(
         trace_counts: &Arc<Mutex<BTreeMap<roots::RootRelativePath, usize>>>,
         path: &roots::RootRelativePath,
@@ -920,6 +995,60 @@ mod tests {
         assert_eq!(
             result.tests,
             Box::from([path("fileE"), path("tests/file-b.test.ts")]),
+        );
+    }
+
+    #[test]
+    fn cross_root_in_flight_cycles_complete_without_deadlock() {
+        let gate = CrossRootCycleGate::default();
+        let graph = cross_root_cycle_graph(
+            BTreeMap::from([
+                (path("root-a.ts"), Box::from([path("bridge-a.ts")])),
+                (
+                    path("bridge-a.ts"),
+                    Box::from([path("root-b.ts"), path("tests/root-a.test.ts")]),
+                ),
+                (path("root-b.ts"), Box::from([path("bridge-b.ts")])),
+                (
+                    path("bridge-b.ts"),
+                    Box::from([path("root-a.ts"), path("tests/root-b.test.ts")]),
+                ),
+            ]),
+            gate,
+        );
+        let request = super::Request {
+            graph,
+            classifier: classifier(Box::from([
+                path("tests/root-a.test.ts"),
+                path("tests/root-b.test.ts"),
+            ])),
+            progress: RecordingSink::default(),
+            memo: super::TraceMemo::default(),
+            scheduler: scheduler(),
+            changed_files: Box::from([path("root-a.ts"), path("root-b.ts")]),
+        };
+
+        // The gate forces both changed roots to be in flight before either root
+        // can discover the other, reproducing the production deadlock shape.
+        let result = super::changed_files(request).unwrap();
+
+        assert_eq!(
+            result.tests,
+            Box::from([path("tests/root-a.test.ts"), path("tests/root-b.test.ts")]),
+        );
+        let cycle_edge = result.cycle_edges.first().unwrap();
+        assert_eq!(result.cycle_edges.len(), 1);
+        assert!(
+            cycle_edge
+                == &super::CycleEdge {
+                    from: path("root-a.ts"),
+                    to: path("root-b.ts"),
+                }
+                || cycle_edge
+                    == &super::CycleEdge {
+                        from: path("root-b.ts"),
+                        to: path("root-a.ts"),
+                    }
         );
     }
 
