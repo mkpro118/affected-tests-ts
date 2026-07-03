@@ -505,6 +505,40 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "package metadata change must stay fail-closed")]
+    fn dependency_change_with_no_known_importer_stays_fail_closed() {
+        let repository = repository_with_file(
+            super::PACKAGE_JSON,
+            r#"{"name":"app","dependencies":{"lodash":"1.0.0"}}"#,
+            r#"{"name":"app","dependencies":{"lodash":"2.0.0"}}"#,
+        );
+        // The graph records no importer for lodash, modeling a package used only
+        // through a type-only import or under `dynamicImports: ignore`.
+        let graph = FixtureGraph::default();
+        let changes = vcs::ChangeSet {
+            files: Box::from([modified(super::PACKAGE_JSON)]),
+        };
+
+        let scoped = super::scoped_changes(&super::ScopeRequest {
+            repository: &repository,
+            base: "base",
+            head: "head",
+            changes: &changes,
+            graph: &graph,
+        })
+        .unwrap();
+
+        // Desired: scoping to zero known importers must not silently erase the
+        // change; package.json should remain so it can fail closed. Current code
+        // drops it entirely, yielding an empty change set.
+        assert!(
+            scoped.files().iter().any(|change| change.path == path(super::PACKAGE_JSON)),
+            "package metadata change must stay fail-closed when it maps to no importers, got {} files",
+            scoped.files().len(),
+        );
+    }
+
+    #[test]
     fn risk_package_changes_remain_global_invalidators() {
         let repository = repository_with_file(
             super::PACKAGE_JSON,

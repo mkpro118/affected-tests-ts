@@ -665,6 +665,27 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "non-code files under __tests__ must not be tests")]
+    fn non_code_files_under_tests_directory_are_not_classified_as_tests() {
+        let config = super::load(super::LoadRequest {
+            file_system: FixtureFileSystem::default(),
+            config_path: None,
+        })
+        .unwrap();
+
+        // Desired: only runnable test code should be classified as a test. The
+        // default `**/__tests__/**/*` pattern also matches fixtures/snapshots,
+        // so this non-code path is wrongly treated as a test today.
+        let fixture_path =
+            roots::RootRelativePath::try_from("src/__tests__/fixtures/data.json").unwrap();
+        assert!(
+            !super::matches_test_file(&config, &fixture_path).unwrap(),
+            "non-code files under __tests__ must not be tests: {}",
+            fixture_path.as_str(),
+        );
+    }
+
+    #[test]
     fn loaded_config_overrides_defaults_and_matches_paths() {
         let request = super::LoadRequest {
             file_system: FixtureFileSystem {

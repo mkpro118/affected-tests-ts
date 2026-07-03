@@ -449,6 +449,38 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "worktree deletion must survive dedup")]
+    fn worktree_deletion_wins_over_committed_modification_for_same_path() {
+        let result = super::changed_files(super::ChangesRequest {
+            repository: FixtureRepository {
+                // The committed range modified the file, but the working tree
+                // deleted it; the final worktree state is what a runner sees.
+                output: Box::<str>::from("M\tsrc/value.ts\n"),
+                worktree_output: Box::<str>::from("D\tsrc/value.ts\n"),
+                untracked_output: Box::<str>::from(""),
+            },
+            base: Box::<str>::from("origin/main"),
+            head: Box::<str>::from("HEAD"),
+            worktree: true,
+        })
+        .unwrap();
+
+        // Desired: the deletion survives so selection can fail closed via
+        // DeletedSourceFile. The status-blind dedup keeps the committed
+        // Modified record instead, so this assertion fails on current code.
+        let survivor = result
+            .files
+            .iter()
+            .find(|change| change.path == path("src/value.ts"))
+            .unwrap();
+        assert!(
+            survivor.status == super::ChangedFileStatus::Deleted,
+            "worktree deletion must survive dedup, got {:?}",
+            survivor.status,
+        );
+    }
+
+    #[test]
     fn worktree_mode_combines_committed_tracked_and_untracked_changes() {
         let result = super::changed_files(super::ChangesRequest {
             repository: FixtureRepository {

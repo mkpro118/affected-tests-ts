@@ -1052,6 +1052,88 @@ mod tests {
         );
     }
 
+    fn equivalence_graph() -> FixtureGraph {
+        // Reverse-dependent graph with an A<->B cycle where A also reaches
+        // testD via D, and Z reaches everything only through B.
+        graph(BTreeMap::from([
+            (
+                path("A"),
+                Box::from([path("B"), path("D")]),
+            ),
+            (
+                path("B"),
+                Box::from([path("A"), path("C")]),
+            ),
+            (path("C"), Box::from([path("tests/c.test.ts")])),
+            (path("D"), Box::from([path("tests/d.test.ts")])),
+            (path("Z"), Box::from([path("B")])),
+        ]))
+    }
+
+    fn equivalence_request(memo: super::TraceMemo) -> super::Request<FixtureGraph, FixtureClassifier, RecordingSink> {
+        super::Request {
+            graph: equivalence_graph(),
+            classifier: classifier(Box::from([
+                path("tests/c.test.ts"),
+                path("tests/d.test.ts"),
+            ])),
+            progress: RecordingSink::default(),
+            memo,
+            // A single worker keeps this proof deterministic; the divergence
+            // comes purely from which trace owned node B first.
+            scheduler: super::TraceScheduler::new(NonZeroUsize::new(1).unwrap()),
+            changed_files: Box::from([path("A"), path("Z")]),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "explained graph must be equivalent across invocations")]
+    fn explained_graph_is_equivalent_regardless_of_which_trace_owned_a_shared_node() {
+        // Natural run: A is traced first and owns B under ancestor [A], so the
+        // A->B->A edge is cut and B memoizes a pruned result that Z then reuses.
+        let natural = super::changed_files(equivalence_request(super::TraceMemo::default())).unwrap();
+
+        // Seeded run: the exact memo state a race can reach when Z owns B first,
+        // i.e. B computed under ancestor [Z] so it reaches testD through A->D.
+        let seeded_memo = super::TraceMemo::default();
+        seeded_memo.statuses().lock().unwrap().insert(
+            path("B"),
+            super::TraceStatus::Complete(super::TraceResult {
+                tests: Box::from([path("tests/c.test.ts"), path("tests/d.test.ts")]),
+                reasons: Box::from([
+                    super::TraceReason {
+                        start: path("B"),
+                        test: path("tests/c.test.ts"),
+                        path: Box::from([path("B"), path("C"), path("tests/c.test.ts")]),
+                    },
+                    super::TraceReason {
+                        start: path("B"),
+                        test: path("tests/d.test.ts"),
+                        path: Box::from([
+                            path("B"),
+                            path("A"),
+                            path("D"),
+                            path("tests/d.test.ts"),
+                        ]),
+                    },
+                ]),
+                cycle_edges: Box::from([]),
+            }),
+        );
+        let seeded = super::changed_files(equivalence_request(seeded_memo)).unwrap();
+
+        // Both runs select the same tests (union is safe), but the explained
+        // reason graph differs: the natural run omits the Z->testD chain that
+        // the seeded run recovers. A consistent tool must not depend on order.
+        assert_eq!(natural.tests, seeded.tests);
+        assert!(
+            natural.reasons == seeded.reasons,
+            "explained graph must be equivalent across invocations: {} vs {} reason chains",
+            natural.reasons.len(),
+            seeded.reasons.len(),
+        );
+    }
+
     #[test]
     fn cycles_complete_without_deadlock_or_duplicate_work() {
         let graph = graph(BTreeMap::from([

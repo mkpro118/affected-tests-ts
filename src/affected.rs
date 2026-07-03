@@ -468,6 +468,30 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "deleted test file must not be selected")]
+    fn deleted_test_file_is_not_emitted_as_a_runnable_test() {
+        let result = super::select(request(Box::from([changed(
+            vcs::ChangedFileStatus::Deleted,
+            "src/file-a.test.ts",
+        )])))
+        .unwrap();
+
+        // Desired: a deleted test cannot run, so it must not appear in the
+        // selection. Current code classifies the path as a test by glob and
+        // emits it as a Partial selection.
+        let selects_deleted_test = match &result {
+            super::AffectedResult::Partial(partial) => {
+                partial.tests.contains(&path("src/file-a.test.ts"))
+            }
+            super::AffectedResult::Full(_) | super::AffectedResult::None => false,
+        };
+        assert!(
+            !selects_deleted_test,
+            "deleted test file must not be selected, got {result:?}",
+        );
+    }
+
+    #[test]
     fn returns_none_for_docs_only_changes_without_always_run_tests() {
         let result = super::select(request(Box::from([changed(
             vcs::ChangedFileStatus::Modified,

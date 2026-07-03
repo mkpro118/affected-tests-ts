@@ -285,6 +285,71 @@ fn create_changed_monorepo_workspace(name: &str) -> path::PathBuf {
     repository_path.join("apps/web")
 }
 
+fn create_changed_subdir_package_dependency(name: &str) -> path::PathBuf {
+    let repository_path = fixture_repo_path(name);
+
+    if repository_path.exists() {
+        fs::remove_dir_all(&repository_path).unwrap();
+    }
+
+    fs::create_dir_all(&repository_path).unwrap();
+    assert_success(&run_command(
+        process::Command::new("git")
+            .arg("init")
+            .arg("-b")
+            .arg("main")
+            .arg(&repository_path),
+    ));
+    write_fixture_file(&WriteFixtureFileRequest {
+        repository_path: &repository_path,
+        relative_path: "apps/web/tsconfig.json",
+        content: MONOREPO_TSCONFIG,
+    });
+    write_fixture_file(&WriteFixtureFileRequest {
+        repository_path: &repository_path,
+        relative_path: "apps/web/package.json",
+        content: "{\"name\":\"web\",\"dependencies\":{\"lodash\":\"1.0.0\"}}\n",
+    });
+    write_fixture_file(&WriteFixtureFileRequest {
+        repository_path: &repository_path,
+        relative_path: "apps/web/src/uses-lodash.ts",
+        content: "import _ from 'lodash';\nexport const value = _;\n",
+    });
+    write_fixture_file(&WriteFixtureFileRequest {
+        repository_path: &repository_path,
+        relative_path: "apps/web/tests/uses-lodash.test.ts",
+        content: "import { value } from '../src/uses-lodash';\nvoid value;\n",
+    });
+    assert_git_success(&run_git(
+        &repository_path,
+        &[
+            "add",
+            "apps/web/tsconfig.json",
+            "apps/web/package.json",
+            "apps/web/src/uses-lodash.ts",
+            "apps/web/tests/uses-lodash.test.ts",
+        ],
+    ));
+    commit_fixture_change(&repository_path, "Add web workspace with lodash dependency");
+    assert_git_success(&run_git(
+        &repository_path,
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    ));
+    assert_git_success(&run_git(
+        &repository_path,
+        &["checkout", "-b", "feature/bump-lodash"],
+    ));
+    write_fixture_file(&WriteFixtureFileRequest {
+        repository_path: &repository_path,
+        relative_path: "apps/web/package.json",
+        content: "{\"name\":\"web\",\"dependencies\":{\"lodash\":\"2.0.0\"}}\n",
+    });
+    assert_git_success(&run_git(&repository_path, &["add", "apps/web/package.json"]));
+    commit_fixture_change(&repository_path, "Bump lodash dependency");
+
+    repository_path.join("apps/web")
+}
+
 fn run_affected_tests(request: CommandRequest<'_>) -> process::Output {
     process::Command::new(env!("CARGO_BIN_EXE_affected-tests-ts"))
         .current_dir(request.repository_path)
@@ -484,6 +549,37 @@ fn worktree_mode_includes_uncommitted_changes() {
     assert_success(&worktree_output);
     assert_eq!(stdout(&default_output), "");
     assert_eq!(stdout(&worktree_output), "tests/value.test.ts\n");
+}
+
+#[test]
+#[should_panic(expected = "subdirectory package dependency change must scope to importer tests")]
+fn package_scoping_engages_when_run_from_a_subdirectory_workspace() {
+    let workspace_path = create_changed_subdir_package_dependency("subdir-scope");
+    let output = run_affected_tests(CommandRequest {
+        repository_path: &workspace_path,
+        args: &[
+            "--base",
+            "origin/main",
+            "--head",
+            "HEAD",
+            "--format",
+            "json",
+        ],
+    });
+
+    // The binary succeeds either way; the flaw is which decision it reaches.
+    assert_success(&output);
+    let content = stdout(&output);
+
+    // Desired: a dependency-only package.json change scopes to the importing
+    // file's test, exactly as it would from the repository root. Because
+    // `git show <rev>:package.json` is resolved at the repo root (not the
+    // apps/web cwd), scoping cannot read the file, falls back to the global
+    // invalidator, and reports "full" instead.
+    assert!(
+        content.contains(r#""status":"partial""#),
+        "subdirectory package dependency change must scope to importer tests, got: {content}",
+    );
 }
 
 #[test]
