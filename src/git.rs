@@ -353,6 +353,23 @@ fn compare_changed_files(left: &ChangedFile, right: &ChangedFile) -> std::cmp::O
     left.path
         .cmp(&right.path)
         .then_with(|| left.previous_path.cmp(&right.previous_path))
+        .then_with(|| dedup_rank(left.status).cmp(&dedup_rank(right.status)))
+}
+
+/// Ranks statuses so the most authoritative record survives dedup for one path.
+///
+/// A worktree deletion must win over a committed modification of the same path:
+/// the file is gone in the working tree, so selection must be able to fail
+/// closed (deleted source files force the full suite).
+const fn dedup_rank(status: ChangedFileStatus) -> u8 {
+    match status {
+        ChangedFileStatus::Deleted => 0,
+        ChangedFileStatus::Added
+        | ChangedFileStatus::Copied
+        | ChangedFileStatus::Modified
+        | ChangedFileStatus::Renamed
+        | ChangedFileStatus::TypeChanged => 1,
+    }
 }
 
 fn git_parse_error(line: &str) -> failure::AppError {
@@ -449,7 +466,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "worktree deletion must survive dedup")]
     fn worktree_deletion_wins_over_committed_modification_for_same_path() {
         let result = super::changed_files(super::ChangesRequest {
             repository: FixtureRepository {
