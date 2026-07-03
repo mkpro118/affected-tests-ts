@@ -573,7 +573,8 @@ fn default_test_pattern_values() -> Box<[Box<str>]> {
         Box::<str>::from("**/*.test.tsx"),
         Box::<str>::from("**/*.spec.ts"),
         Box::<str>::from("**/*.spec.tsx"),
-        Box::<str>::from("**/__tests__/**/*"),
+        Box::<str>::from("**/__tests__/**/*.ts"),
+        Box::<str>::from("**/__tests__/**/*.tsx"),
     ])
 }
 
@@ -646,7 +647,8 @@ mod tests {
                 Box::<str>::from("**/*.test.tsx"),
                 Box::<str>::from("**/*.spec.ts"),
                 Box::<str>::from("**/*.spec.tsx"),
-                Box::<str>::from("**/__tests__/**/*"),
+                Box::<str>::from("**/__tests__/**/*.ts"),
+                Box::<str>::from("**/__tests__/**/*.tsx"),
             ]),
         );
         assert_eq!(
@@ -665,7 +667,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "non-code files under __tests__ must not be tests")]
     fn non_code_files_under_tests_directory_are_not_classified_as_tests() {
         let config = super::load(super::LoadRequest {
             file_system: FixtureFileSystem::default(),
