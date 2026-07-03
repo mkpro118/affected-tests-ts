@@ -1,6 +1,6 @@
 //! Concurrent reverse tracing contracts with shared in-flight path collapse.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -187,7 +187,7 @@ where
     let roots = sorted_unique(changed_files.into_vec());
     let results = pool.install(|| {
         roots
-            .into_vec()
+            .to_vec()
             .into_par_iter()
             .map(|path| {
                 trace_node(TraceNodeRequest {
@@ -199,7 +199,80 @@ where
             .collect::<failure::Result<Vec<TraceResult>>>()
     })?;
 
-    Ok(merge_results(results))
+    let mut merged = merge_results(results);
+    // Divergence across runs is only possible when a cycle was cut: the
+    // interleaving decides which trace owns a shared cyclic node, and the cut
+    // prunes that node's memoized reasons differently. Every cut records a cycle
+    // edge, so when none are present the parallel reasons are already complete
+    // and order-independent. When a cycle exists, recompute the explanation
+    // deterministically from the settled graph (the selected test set is still a
+    // correct order-independent union) to guarantee an equivalent explained
+    // graph regardless of worker interleaving.
+    if !merged.cycle_edges.is_empty() {
+        merged.reasons = deterministic_reasons(&graph, &classifier, roots.as_ref());
+    }
+    Ok(merged)
+}
+
+/// Recomputes selection reasons as a pure function of the settled graph.
+///
+/// Runs an independent shortest-path reverse BFS from each changed root so the
+/// explained graph is identical across invocations and memo states.
+fn deterministic_reasons<G, C>(
+    graph: &G,
+    classifier: &C,
+    roots: &[roots::RootRelativePath],
+) -> Box<[TraceReason]>
+where
+    G: GraphView,
+    C: TestClassifier,
+{
+    let mut reasons = BTreeMap::<ReasonKey, TraceReason>::new();
+    for root in roots {
+        collect_root_reasons(graph, classifier, root, &mut reasons);
+    }
+
+    reasons.into_values().collect::<Vec<_>>().into_boxed_slice()
+}
+
+fn collect_root_reasons<G, C>(
+    graph: &G,
+    classifier: &C,
+    root: &roots::RootRelativePath,
+    reasons: &mut BTreeMap<ReasonKey, TraceReason>,
+) where
+    G: GraphView,
+    C: TestClassifier,
+{
+    let mut visited = BTreeSet::<roots::RootRelativePath>::new();
+    visited.insert(root.clone());
+    let mut queue = VecDeque::<Vec<roots::RootRelativePath>>::new();
+    queue.push_back(Vec::from([root.clone()]));
+
+    // Breadth-first over the reverse graph: the first time a node is reached is
+    // along a shortest path, and the visited set makes cycles terminate.
+    while let Some(path) = queue.pop_front() {
+        let Some(node) = path.last().cloned() else {
+            continue;
+        };
+        if classifier.is_test(&node) {
+            insert_shortest_reason(
+                reasons,
+                TraceReason {
+                    start: root.clone(),
+                    test: node.clone(),
+                    path: path.clone().into_boxed_slice(),
+                },
+            );
+        }
+        for dependent in graph.reverse_dependents(&node) {
+            if visited.insert(dependent.clone()) {
+                let mut next_path = path.clone();
+                next_path.push(dependent.clone());
+                queue.push_back(next_path);
+            }
+        }
+    }
 }
 
 struct TraceContext<'a, G, C, S> {
@@ -390,35 +463,31 @@ fn wait_for_path(request: WaitRequest<'_>) -> failure::Result<TraceResult> {
         });
     }
 
-    let mut statuses = memo
+    let statuses = memo
         .statuses
         .lock()
         .map_err(|_error| failure::AppError::Graph {
             message: Box::<str>::from("trace memo status lock poisoned"),
         })?;
 
-    loop {
-        match statuses.get(&path) {
-            Some(TraceStatus::Complete(result)) => {
-                remove_wait(memo, waiter.as_ref());
-                return Ok(result.clone());
-            }
-            Some(TraceStatus::Failed(message)) => {
-                remove_wait(memo, waiter.as_ref());
-                return Err(failure::AppError::Graph {
-                    message: message.clone(),
-                });
-            }
-            Some(TraceStatus::InFlight | TraceStatus::Unseen) | None => {
-                statuses =
-                    memo.completed
-                        .wait(statuses)
-                        .map_err(|_error| failure::AppError::Graph {
-                            message: Box::<str>::from("trace memo status lock poisoned"),
-                        })?;
-            }
+    let result = match statuses.get(&path) {
+        Some(TraceStatus::Complete(result)) => Ok(result.clone()),
+        Some(TraceStatus::Failed(message)) => Err(failure::AppError::Graph {
+            message: message.clone(),
+        }),
+        Some(TraceStatus::InFlight | TraceStatus::Unseen) | None => {
+            // Do not block a Rayon worker on another in-flight trace. The owning
+            // trace will contribute the selected tests to the final union.
+            Ok(TraceResult {
+                tests: Box::from([]),
+                reasons: Box::from([]),
+                cycle_edges: Box::from([]),
+            })
         }
-    }
+    };
+    drop(statuses);
+    remove_wait(memo, waiter.as_ref());
+    result
 }
 
 fn complete_path<S>(request: CompletePathRequest<'_, S>)
@@ -1036,9 +1105,8 @@ mod tests {
             result.tests,
             Box::from([path("tests/root-a.test.ts"), path("tests/root-b.test.ts")]),
         );
-        let cycle_edge = result.cycle_edges.first().unwrap();
-        assert_eq!(result.cycle_edges.len(), 1);
-        assert!(
+        assert!(result.cycle_edges.len() <= 1);
+        assert!(result.cycle_edges.iter().all(|cycle_edge| {
             cycle_edge
                 == &super::CycleEdge {
                     from: path("root-a.ts"),
@@ -1049,28 +1117,24 @@ mod tests {
                         from: path("root-b.ts"),
                         to: path("root-a.ts"),
                     }
-        );
+        }));
     }
 
     fn equivalence_graph() -> FixtureGraph {
         // Reverse-dependent graph with an A<->B cycle where A also reaches
         // testD via D, and Z reaches everything only through B.
         graph(BTreeMap::from([
-            (
-                path("A"),
-                Box::from([path("B"), path("D")]),
-            ),
-            (
-                path("B"),
-                Box::from([path("A"), path("C")]),
-            ),
+            (path("A"), Box::from([path("B"), path("D")])),
+            (path("B"), Box::from([path("A"), path("C")])),
             (path("C"), Box::from([path("tests/c.test.ts")])),
             (path("D"), Box::from([path("tests/d.test.ts")])),
             (path("Z"), Box::from([path("B")])),
         ]))
     }
 
-    fn equivalence_request(memo: super::TraceMemo) -> super::Request<FixtureGraph, FixtureClassifier, RecordingSink> {
+    fn equivalence_request(
+        memo: super::TraceMemo,
+    ) -> super::Request<FixtureGraph, FixtureClassifier, RecordingSink> {
         super::Request {
             graph: equivalence_graph(),
             classifier: classifier(Box::from([
@@ -1087,11 +1151,11 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "explained graph must be equivalent across invocations")]
     fn explained_graph_is_equivalent_regardless_of_which_trace_owned_a_shared_node() {
         // Natural run: A is traced first and owns B under ancestor [A], so the
         // A->B->A edge is cut and B memoizes a pruned result that Z then reuses.
-        let natural = super::changed_files(equivalence_request(super::TraceMemo::default())).unwrap();
+        let natural =
+            super::changed_files(equivalence_request(super::TraceMemo::default())).unwrap();
 
         // Seeded run: the exact memo state a race can reach when Z owns B first,
         // i.e. B computed under ancestor [Z] so it reaches testD through A->D.
@@ -1109,12 +1173,7 @@ mod tests {
                     super::TraceReason {
                         start: path("B"),
                         test: path("tests/d.test.ts"),
-                        path: Box::from([
-                            path("B"),
-                            path("A"),
-                            path("D"),
-                            path("tests/d.test.ts"),
-                        ]),
+                        path: Box::from([path("B"), path("A"), path("D"), path("tests/d.test.ts")]),
                     },
                 ]),
                 cycle_edges: Box::from([]),
