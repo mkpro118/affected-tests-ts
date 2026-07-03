@@ -252,6 +252,13 @@ where
 }
 
 fn changed_trace_paths(change: &vcs::ChangedFile) -> Box<[roots::RootRelativePath]> {
+    if change.status == vcs::ChangedFileStatus::Deleted {
+        // A deleted file no longer exists in the graph and cannot be run, so it
+        // must not seed tracing (deleted source files already fail closed
+        // earlier; deleted tests must not be reported as runnable).
+        return Box::from([]);
+    }
+
     change.previous_path.as_ref().map_or_else(
         || Box::from([change.path.clone()]),
         |previous_path| Box::from([previous_path.clone(), change.path.clone()]),
@@ -468,7 +475,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "deleted test file must not be selected")]
     fn deleted_test_file_is_not_emitted_as_a_runnable_test() {
         let result = super::select(request(Box::from([changed(
             vcs::ChangedFileStatus::Deleted,
