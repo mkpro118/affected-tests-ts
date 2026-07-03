@@ -353,6 +353,82 @@ fn create_changed_subdir_package_dependency(name: &str) -> path::PathBuf {
     repository_path.join("apps/web")
 }
 
+fn create_changed_subdir_binary_lockfile(name: &str) -> path::PathBuf {
+    let repository_path = fixture_repo_path(name);
+
+    if repository_path.exists() {
+        fs::remove_dir_all(&repository_path).unwrap();
+    }
+
+    fs::create_dir_all(&repository_path).unwrap();
+    assert_success(&run_command(
+        process::Command::new("git")
+            .arg("init")
+            .arg("-b")
+            .arg("main")
+            .arg(&repository_path),
+    ));
+    write_fixture_file(&WriteFixtureFileRequest {
+        repository_path: &repository_path,
+        relative_path: "apps/mobile/tsconfig.json",
+        content: MONOREPO_TSCONFIG,
+    });
+    write_fixture_file(&WriteFixtureFileRequest {
+        repository_path: &repository_path,
+        relative_path: "apps/mobile/src/value.ts",
+        content: BLUEPRINT_SOURCE,
+    });
+    write_fixture_file(&WriteFixtureFileRequest {
+        repository_path: &repository_path,
+        relative_path: "apps/mobile/tests/value.test.ts",
+        content: BLUEPRINT_TEST,
+    });
+    // A binary lockfile is deliberately not valid UTF-8, mirroring Bun's
+    // `bun.lockb`. Reading it back through `git show` must not abort the run.
+    write_binary_fixture_file(
+        &repository_path.join("apps/mobile/bun.lockb"),
+        &[0x62, 0x75, 0x6e, 0xff, 0xfe, 0x00, 0x01, 0x02],
+    );
+    assert_git_success(&run_git(
+        &repository_path,
+        &[
+            "add",
+            "apps/mobile/tsconfig.json",
+            "apps/mobile/src/value.ts",
+            "apps/mobile/tests/value.test.ts",
+            "apps/mobile/bun.lockb",
+        ],
+    ));
+    commit_fixture_change(
+        &repository_path,
+        "Add mobile workspace with binary lockfile",
+    );
+    assert_git_success(&run_git(
+        &repository_path,
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    ));
+    assert_git_success(&run_git(
+        &repository_path,
+        &["checkout", "-b", "feature/relock"],
+    ));
+    write_binary_fixture_file(
+        &repository_path.join("apps/mobile/bun.lockb"),
+        &[0x62, 0x75, 0x6e, 0x00, 0xff, 0xfe, 0x03, 0x04, 0x05],
+    );
+    assert_git_success(&run_git(
+        &repository_path,
+        &["add", "apps/mobile/bun.lockb"],
+    ));
+    commit_fixture_change(&repository_path, "Relock dependencies");
+
+    repository_path.join("apps/mobile")
+}
+
+fn write_binary_fixture_file(file_path: &path::Path, content: &[u8]) {
+    fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+    fs::write(file_path, content).unwrap();
+}
+
 fn run_affected_tests(request: CommandRequest<'_>) -> process::Output {
     process::Command::new(env!("CARGO_BIN_EXE_affected-tests-ts"))
         .current_dir(request.repository_path)
@@ -581,6 +657,37 @@ fn package_scoping_engages_when_run_from_a_subdirectory_workspace() {
     assert!(
         content.contains(r#""status":"partial""#),
         "subdirectory package dependency change must scope to importer tests, got: {content}",
+    );
+}
+
+#[test]
+fn binary_lockfile_change_fails_closed_instead_of_aborting_on_non_utf8() {
+    let workspace_path = create_changed_subdir_binary_lockfile("binary-lockfile");
+    let output = run_affected_tests(CommandRequest {
+        repository_path: &workspace_path,
+        args: &[
+            "--base",
+            "origin/main",
+            "--head",
+            "HEAD",
+            "--format",
+            "json",
+        ],
+    });
+
+    // A binary lockfile is not valid UTF-8, so reading it back through
+    // `git show` must not crash the run with a UTF-8 decoding error.
+    assert!(
+        output.status.success(),
+        "binary lockfile run failed: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    // It cannot be parsed for scoping, so it stays a global invalidator and
+    // the run fails closed to the full suite.
+    let content = stdout(&output);
+    assert!(
+        content.contains(r#""status":"full""#),
+        "binary lockfile change must fail closed to full, got: {content}",
     );
 }
 

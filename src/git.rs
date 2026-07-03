@@ -213,12 +213,13 @@ impl GitRepository for ProcessRepository {
             return Ok(None);
         }
 
-        String::from_utf8(output.stdout)
-            .map(String::into_boxed_str)
-            .map(Some)
-            .map_err(|error| failure::AppError::Git {
-                message: format!("git show output was not UTF-8: {error}").into_boxed_str(),
-            })
+        // Binary metadata (for example a binary `bun.lockb` lockfile) is not
+        // valid UTF-8 and cannot be parsed as text. Treat it as unavailable so
+        // scoping falls back to the fail-closed global invalidator instead of
+        // aborting the whole run.
+        Ok(String::from_utf8(output.stdout)
+            .ok()
+            .map(String::into_boxed_str))
     }
 }
 
