@@ -118,10 +118,16 @@ where
         return Ok(None);
     }
 
-    Ok(Some(importers_for_packages(
-        request.graph,
-        &changed_packages,
-    )))
+    let importers = importers_for_packages(request.graph, &changed_packages);
+    if importers.is_empty() {
+        // The dependency changed but no known file imports it at runtime (for
+        // example it is only reachable through a type-only import). Keep the
+        // metadata change so it stays a fail-closed global invalidator rather
+        // than silently selecting nothing.
+        return Ok(None);
+    }
+
+    Ok(Some(importers))
 }
 
 fn changed_package_json_packages(old_text: &str, new_text: &str) -> Option<BTreeSet<Box<str>>> {
@@ -505,7 +511,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "package metadata change must stay fail-closed")]
     fn dependency_change_with_no_known_importer_stays_fail_closed() {
         let repository = repository_with_file(
             super::PACKAGE_JSON,
@@ -532,7 +537,10 @@ mod tests {
         // change; package.json should remain so it can fail closed. Current code
         // drops it entirely, yielding an empty change set.
         assert!(
-            scoped.files().iter().any(|change| change.path == path(super::PACKAGE_JSON)),
+            scoped
+                .files()
+                .iter()
+                .any(|change| change.path == path(super::PACKAGE_JSON)),
             "package metadata change must stay fail-closed when it maps to no importers, got {} files",
             scoped.files().len(),
         );
