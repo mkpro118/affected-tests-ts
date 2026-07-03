@@ -344,7 +344,10 @@ fn create_changed_subdir_package_dependency(name: &str) -> path::PathBuf {
         relative_path: "apps/web/package.json",
         content: "{\"name\":\"web\",\"dependencies\":{\"lodash\":\"2.0.0\"}}\n",
     });
-    assert_git_success(&run_git(&repository_path, &["add", "apps/web/package.json"]));
+    assert_git_success(&run_git(
+        &repository_path,
+        &["add", "apps/web/package.json"],
+    ));
     commit_fixture_change(&repository_path, "Bump lodash dependency");
 
     repository_path.join("apps/web")
@@ -552,7 +555,6 @@ fn worktree_mode_includes_uncommitted_changes() {
 }
 
 #[test]
-#[should_panic(expected = "subdirectory package dependency change must scope to importer tests")]
 fn package_scoping_engages_when_run_from_a_subdirectory_workspace() {
     let workspace_path = create_changed_subdir_package_dependency("subdir-scope");
     let output = run_affected_tests(CommandRequest {

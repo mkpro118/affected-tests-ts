@@ -194,7 +194,11 @@ impl GitRepository for ProcessRepository {
         revision: &str,
         path: &roots::RootRelativePath,
     ) -> failure::Result<Option<Box<str>>> {
-        let object = format!("{revision}:{}", path.as_str());
+        // The `./` prefix resolves the path relative to the invocation
+        // directory (set via `-C`), matching the `--relative` diff paths. Without
+        // it, `git show <rev>:<path>` resolves against the repository root and
+        // silently fails to read files when run from a subdirectory workspace.
+        let object = format!("{revision}:./{}", path.as_str());
         let output = process::Command::new("git")
             .arg("-C")
             .arg(path::Path::new(self.working_directory.as_ref()))
