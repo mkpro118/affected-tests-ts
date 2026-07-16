@@ -63,6 +63,12 @@ Print JSON with reason chains:
 affected-tests-ts --base origin/main --head HEAD --format json --explain
 ```
 
+Print a human-readable explanation of the current selection:
+
+```sh
+affected-tests-ts --base origin/main --head HEAD --explain
+```
+
 Inspect the dependency graph:
 
 ```sh
@@ -98,11 +104,13 @@ run the command from the package or app directory whose tests you want to select
 `--format shell`
 
 Prints newline-delimited runnable test paths. This is the default and is intended
-for piping into test runners. Status text is not printed to stdout.
+for piping into test runners, unless `--explain` is used without an explicit
+format. Status text is not printed to stdout.
 
 `--format plain`
 
-Prints a human-readable status and paths.
+Prints a human-readable status, paths, and reason chains when `--explain` is
+enabled.
 
 `--format json`
 

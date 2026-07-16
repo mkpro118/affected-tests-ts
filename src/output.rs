@@ -172,11 +172,17 @@ fn render_plain_full(full: &contract::FullResult) -> Box<str> {
 
 fn render_plain_partial(partial: &contract::PartialResult) -> Box<str> {
     let tests = newline_join(partial.tests.as_ref());
-    if tests.is_empty() {
-        Box::<str>::from("partial\n")
+    let reasons = render_plain_reasons(partial.reasons.as_ref());
+    let mut content = if tests.is_empty() {
+        String::from("partial\n")
     } else {
-        format!("partial\n{tests}").into_boxed_str()
+        format!("partial\n{tests}")
+    };
+    if !reasons.is_empty() {
+        content.push_str("reasons\n");
+        content.push_str(reasons.as_ref());
     }
+    content.into_boxed_str()
 }
 
 fn render_plain_none(none: &contract::NoneResult) -> Box<str> {
@@ -186,6 +192,22 @@ fn render_plain_none(none: &contract::NoneResult) -> Box<str> {
     } else {
         format!("none\n{changed_files}").into_boxed_str()
     }
+}
+
+fn render_plain_reasons(reasons: &[contract::ReasonChain]) -> Box<str> {
+    let mut content = String::new();
+    for reason in reasons {
+        content.push_str(reason.changed_file.as_ref());
+        content.push_str(" -> ");
+        content.push_str(reason.test_file.as_ref());
+        content.push('\n');
+        for path in reason.path.as_ref() {
+            content.push_str("  ");
+            content.push_str(path.as_ref());
+            content.push('\n');
+        }
+    }
+    content.into_boxed_str()
 }
 
 fn newline_join(lines: &[Box<str>]) -> Box<str> {
@@ -242,6 +264,18 @@ mod tests {
         .unwrap();
 
         shell_sink.content.lock().unwrap().clone()
+    }
+
+    fn plain_output_for(result: contract::CommandResult) -> String {
+        let plain_sink = RecordingSink::default();
+        super::render(super::RenderRequest {
+            sink: plain_sink.clone(),
+            format: super::Format::Plain,
+            result,
+        })
+        .unwrap();
+
+        plain_sink.content.lock().unwrap().clone()
     }
 
     #[test]
@@ -311,6 +345,33 @@ mod tests {
         assert_eq!(shell_output_for(full_result), "src/full-suite.test.ts\n");
         assert_eq!(shell_output_for(none_result), "");
         assert_eq!(shell_output_for(error_result), "");
+    }
+
+    #[test]
+    fn plain_output_includes_reason_chains_when_present() {
+        let result = contract::CommandResult::Partial(contract::PartialResult {
+            tests: Box::from([Box::<str>::from("src/button.test.tsx")]),
+            reasons: Box::from([contract::ReasonChain {
+                changed_file: Box::<str>::from("src/button.tsx"),
+                test_file: Box::<str>::from("src/button.test.tsx"),
+                path: Box::from([
+                    Box::<str>::from("src/button.tsx"),
+                    Box::<str>::from("src/button.test.tsx"),
+                ]),
+            }]),
+        });
+
+        assert_eq!(
+            plain_output_for(result),
+            concat!(
+                "partial\n",
+                "src/button.test.tsx\n",
+                "reasons\n",
+                "src/button.tsx -> src/button.test.tsx\n",
+                "  src/button.tsx\n",
+                "  src/button.test.tsx\n",
+            )
+        );
     }
 
     #[test]

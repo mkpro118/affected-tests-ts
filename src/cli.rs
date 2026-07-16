@@ -10,8 +10,8 @@ pub struct Args {
     #[command(subcommand)]
     pub command: Option<Command>,
     /// Output format for machine or human consumers.
-    #[arg(long = "format", value_enum, default_value = "shell", global = true)]
-    pub format: Format,
+    #[arg(long = "format", value_enum, global = true)]
+    pub format: Option<Format>,
     /// Git base revision used for changed-file detection.
     #[arg(long, global = true)]
     pub base: Option<Box<str>>,

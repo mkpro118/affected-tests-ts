@@ -60,6 +60,15 @@ const EXPLAIN_WITH_GLOBAL_RANGE_ARGS: &[&str] = &[
     "--head",
     "HEAD",
 ];
+const SHELL_EXPLAIN_ARGS: &[&str] = &[
+    "--base",
+    "origin/main",
+    "--head",
+    "HEAD",
+    "--format",
+    "shell",
+    "--explain",
+];
 const VERSION_ARGS: &[&str] = &["--version"];
 
 static NEXT_REPOSITORY_ID: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
@@ -500,7 +509,17 @@ fn assert_monorepo_graph_output(output: &process::Output) {
 }
 
 fn assert_monorepo_metadata_outputs(outputs: &MonorepoCommandOutputs) {
-    assert_eq!(stdout(&outputs.explain), "tests/value.test.ts\n");
+    assert_eq!(
+        stdout(&outputs.explain),
+        concat!(
+            "partial\n",
+            "tests/value.test.ts\n",
+            "reasons\n",
+            "src/value.ts -> tests/value.test.ts\n",
+            "  src/value.ts\n",
+            "  tests/value.test.ts\n",
+        )
+    );
     assert!(stdout(&outputs.version).contains(env!("CARGO_PKG_VERSION")));
 }
 
@@ -576,6 +595,10 @@ fn default_shell_tui_docker_graph_and_explain_commands_are_wired() {
         repository_path: &fixture_repo,
         args: &["explain", "src/value.ts"],
     });
+    let shell_explain_output = run_affected_tests(CommandRequest {
+        repository_path: &fixture_repo,
+        args: SHELL_EXPLAIN_ARGS,
+    });
 
     // The blueprint files are materialized into real repositories so these
     // command forms validate process, Git, and filesystem boundaries together.
@@ -584,11 +607,23 @@ fn default_shell_tui_docker_graph_and_explain_commands_are_wired() {
     assert_success(&docker_output);
     assert_success(&graph_output);
     assert_success(&explain_output);
+    assert_success(&shell_explain_output);
     assert_eq!(stdout(&shell_output), "tests/value.test.ts\n");
     assert_eq!(stdout(&tui_output), "partial\ntests/value.test.ts\n");
     assert!(stdout(&docker_output).contains("=> [result"));
     assert!(stdout(&graph_output).contains(r#""nodes""#));
-    assert_eq!(stdout(&explain_output), "tests/value.test.ts\n");
+    assert_eq!(
+        stdout(&explain_output),
+        concat!(
+            "partial\n",
+            "tests/value.test.ts\n",
+            "reasons\n",
+            "src/value.ts -> tests/value.test.ts\n",
+            "  src/value.ts\n",
+            "  tests/value.test.ts\n",
+        )
+    );
+    assert_eq!(stdout(&shell_explain_output), "tests/value.test.ts\n");
 }
 
 #[test]

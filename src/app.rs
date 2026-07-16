@@ -54,6 +54,12 @@ struct ExplainCommand {
     terminal_mode: TerminalMode,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SelectionFormatRequest {
+    format: Option<cli::Format>,
+    include_reasons: bool,
+}
+
 /// Runs the CLI application from process arguments.
 ///
 /// # Errors
@@ -84,10 +90,10 @@ pub fn run_with(request: Request) -> failure::Result<()> {
     } = request;
     match &args.command {
         Some(cli::Command::Graph) => run_graph(GraphCommand {
-            format: app_render::format(args.format),
+            format: optional_format(args.format).unwrap_or(presentation::Format::Plain),
         }),
         Some(cli::Command::Explain { test }) => run_explain(ExplainCommand {
-            format: app_render::format(args.format),
+            format: optional_format(args.format).unwrap_or(presentation::Format::Plain),
             path: roots::RootRelativePath::try_from(test.clone())?,
             terminal_mode,
         }),
@@ -101,11 +107,26 @@ pub fn run_with(request: Request) -> failure::Result<()> {
                 .clone()
                 .unwrap_or_else(|| Box::<str>::from("HEAD")),
             worktree: args.worktree,
-            format: app_render::format(args.format),
+            format: selection_format(SelectionFormatRequest {
+                format: args.format,
+                include_reasons: args.explain,
+            }),
             include_reasons: args.explain,
             terminal_mode,
         }),
     }
+}
+
+fn selection_format(request: SelectionFormatRequest) -> presentation::Format {
+    optional_format(request.format).unwrap_or(if request.include_reasons {
+        presentation::Format::Plain
+    } else {
+        presentation::Format::Shell
+    })
+}
+
+fn optional_format(format: Option<cli::Format>) -> Option<presentation::Format> {
+    format.map(app_render::format)
 }
 
 fn run_selection(request: SelectionCommand) -> failure::Result<()> {
