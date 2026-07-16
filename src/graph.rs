@@ -115,7 +115,8 @@ where
             config: &self.config,
             mode: self.failure_mode,
             unsupported_count: imports.unsupported_dynamic_imports.len(),
-        }) {
+            importer: path,
+        })? {
             return Err(failure::AppError::UnknownDynamicImport {
                 importer: path.clone(),
             });
@@ -209,15 +210,29 @@ struct DynamicImportFailureRequest<'a, C> {
     config: &'a C,
     mode: ImportFailureMode,
     unsupported_count: usize,
+    importer: &'a roots::RootRelativePath,
 }
 
-fn should_fail_for_dynamic_imports<C>(request: &DynamicImportFailureRequest<'_, C>) -> bool
+fn should_fail_for_dynamic_imports<C>(
+    request: &DynamicImportFailureRequest<'_, C>,
+) -> failure::Result<bool>
 where
     C: settings::View,
 {
-    request.mode == ImportFailureMode::Strict
-        && request.unsupported_count > 0
-        && request.config.dynamic_imports() == settings::UnknownDynamicImportBehavior::FailClosed
+    if request.mode != ImportFailureMode::Strict
+        || request.unsupported_count == 0
+        || request.config.dynamic_imports() != settings::UnknownDynamicImportBehavior::FailClosed
+    {
+        return Ok(false);
+    }
+
+    // Files listed in `dynamicImportIgnore` opt out of the fail-closed policy so a
+    // single genuinely-unresolvable dynamic import (e.g. `import(absolutePath)`)
+    // does not force the entire suite on every reachable PR.
+    Ok(!settings::matches_dynamic_import_ignore(
+        request.config,
+        request.importer,
+    )?)
 }
 
 fn resolve_imports<C, M, P>(
@@ -398,6 +413,26 @@ mod tests {
     #[derive(Clone, Debug)]
     struct FixtureConfig {
         dynamic_imports: settings::UnknownDynamicImportBehavior,
+        dynamic_import_ignore: Box<[settings::Pattern]>,
+    }
+
+    impl FixtureConfig {
+        fn fail_closed() -> Self {
+            Self {
+                dynamic_imports: settings::UnknownDynamicImportBehavior::FailClosed,
+                dynamic_import_ignore: Box::from([]),
+            }
+        }
+
+        fn fail_closed_ignoring(globs: &[&str]) -> Self {
+            Self {
+                dynamic_imports: settings::UnknownDynamicImportBehavior::FailClosed,
+                dynamic_import_ignore: globs
+                    .iter()
+                    .map(|glob| settings::Pattern::try_from(*glob).unwrap())
+                    .collect(),
+            }
+        }
     }
 
     impl settings::View for FixtureConfig {
@@ -419,6 +454,10 @@ mod tests {
 
         fn dynamic_imports(&self) -> settings::UnknownDynamicImportBehavior {
             self.dynamic_imports
+        }
+
+        fn dynamic_import_ignore(&self) -> &[settings::Pattern] {
+            self.dynamic_import_ignore.as_ref()
         }
     }
 
@@ -490,9 +529,7 @@ mod tests {
             ),
         ]));
         let imports = super::LocalImports::new(super::LocalImportsRequest {
-            config: FixtureConfig {
-                dynamic_imports: settings::UnknownDynamicImportBehavior::FailClosed,
-            },
+            config: FixtureConfig::fail_closed(),
             reader: file_system.clone(),
             resolver: FixtureResolver,
             probe: file_system,
@@ -519,9 +556,7 @@ mod tests {
             ),
         )]));
         let imports = super::LocalImports::new(super::LocalImportsRequest {
-            config: FixtureConfig {
-                dynamic_imports: settings::UnknownDynamicImportBehavior::FailClosed,
-            },
+            config: FixtureConfig::fail_closed(),
             reader: file_system.clone(),
             resolver: FixtureResolver,
             probe: file_system,
@@ -549,9 +584,7 @@ mod tests {
             Box::<str>::from("const page = import(routeName);"),
         )]));
         let imports = super::LocalImports::new(super::LocalImportsRequest {
-            config: FixtureConfig {
-                dynamic_imports: settings::UnknownDynamicImportBehavior::FailClosed,
-            },
+            config: FixtureConfig::fail_closed(),
             reader: file_system.clone(),
             resolver: FixtureResolver,
             probe: file_system,
@@ -569,6 +602,86 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_dynamic_import_in_ignored_file_does_not_force_full_run() {
+        // A file that dynamically imports a runtime-computed path (the real-world
+        // `await import(absolutePath)` case) is normally fail-closed, but listing
+        // it in dynamicImportIgnore must exempt it so it no longer forces a full
+        // suite. The static import edge is still resolved.
+        let file_system = vfs::VirtualFileSystem::with_files(Box::from([
+            (
+                path("src/graphql-contract/collector.ts"),
+                Box::<str>::from(
+                    "import './types';\nconst absolutePath = join(dir, rel);\nconst m = import(absolutePath);",
+                ),
+            ),
+            (
+                path("src/graphql-contract/types.ts"),
+                Box::<str>::from("export const kinds = [];"),
+            ),
+        ]));
+        let imports = super::LocalImports::new(super::LocalImportsRequest {
+            config: FixtureConfig::fail_closed_ignoring(&["src/graphql-contract/collector.ts"]),
+            reader: file_system.clone(),
+            resolver: FixtureResolver,
+            probe: file_system,
+        });
+
+        let import_edges = super::ImportResolver::imports_for(
+            &imports,
+            &path("src/graphql-contract/collector.ts"),
+        )
+        .expect("ignored file must not force a full run");
+
+        assert_eq!(
+            import_edges.dependencies,
+            Box::<[roots::RootRelativePath]>::from([path("src/graphql-contract/types.ts")]),
+        );
+    }
+
+    #[test]
+    fn unsupported_dynamic_import_outside_ignore_list_still_fails_closed() {
+        // The ignore list must be scoped to the files it names: a different file
+        // with the same unresolvable pattern keeps the fail-closed safety net.
+        let file_system = vfs::VirtualFileSystem::with_files(Box::from([(
+            path("src/router.ts"),
+            Box::<str>::from("const page = import(routeName);"),
+        )]));
+        let imports = super::LocalImports::new(super::LocalImportsRequest {
+            config: FixtureConfig::fail_closed_ignoring(&["src/graphql-contract/collector.ts"]),
+            reader: file_system.clone(),
+            resolver: FixtureResolver,
+            probe: file_system,
+        });
+
+        let error =
+            super::ImportResolver::imports_for(&imports, &path("src/router.ts")).unwrap_err();
+
+        assert!(matches!(
+            error,
+            failure::AppError::UnknownDynamicImport { importer } if importer == path("src/router.ts")
+        ));
+    }
+
+    #[test]
+    fn dynamic_import_ignore_supports_glob_matching() {
+        // A directory glob should exempt every file under the noisy subtree, not
+        // just one exact path, so teams can quarantine a whole module.
+        let file_system = vfs::VirtualFileSystem::with_files(Box::from([(
+            path("src/graphql-contract/loader.ts"),
+            Box::<str>::from("const m = import(absolutePath);"),
+        )]));
+        let imports = super::LocalImports::new(super::LocalImportsRequest {
+            config: FixtureConfig::fail_closed_ignoring(&["src/graphql-contract/**"]),
+            reader: file_system.clone(),
+            resolver: FixtureResolver,
+            probe: file_system,
+        });
+
+        super::ImportResolver::imports_for(&imports, &path("src/graphql-contract/loader.ts"))
+            .expect("glob-matched file must not force a full run");
+    }
+
+    #[test]
     fn graph_output_imports_keep_static_edges_across_dynamic_imports() {
         let file_system = vfs::VirtualFileSystem::with_files(Box::from([
             (
@@ -583,9 +696,7 @@ mod tests {
             ),
         ]));
         let imports = super::LocalImports::for_graph_output(super::LocalImportsRequest {
-            config: FixtureConfig {
-                dynamic_imports: settings::UnknownDynamicImportBehavior::FailClosed,
-            },
+            config: FixtureConfig::fail_closed(),
             reader: file_system.clone(),
             resolver: FixtureResolver,
             probe: file_system,
@@ -609,9 +720,7 @@ mod tests {
             Box::<str>::from("import { missing } from './missing';"),
         )]));
         let imports = super::LocalImports::new(super::LocalImportsRequest {
-            config: FixtureConfig {
-                dynamic_imports: settings::UnknownDynamicImportBehavior::FailClosed,
-            },
+            config: FixtureConfig::fail_closed(),
             reader: file_system.clone(),
             resolver: FixtureResolver,
             probe: file_system,

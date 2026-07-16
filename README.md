@@ -260,6 +260,7 @@ Example `affected-tests.json`:
     "tsconfig.json"
   ],
   "dynamicImports": "failClosed",
+  "dynamicImportIgnore": ["src/graphql-contract/**"],
   "compilerOptions": {
     "baseUrl": ".",
     "paths": {
@@ -277,6 +278,14 @@ Defaults:
 - Excludes: `node_modules/**`, `dist/**`, `build/**`, `.next/**`
 - Global invalidators: `package.json`, `bun.lock`, `bun.lockb`, `tsconfig.json`
 - Dynamic imports: `failClosed`
+- Dynamic import ignore: empty (no files exempted)
+
+`dynamicImportIgnore` is a list of globs matched against the importing file's
+root-relative path. When `dynamicImports` is `failClosed`, a file matching one of
+these globs is exempt from the full-suite trigger for its own unresolvable dynamic
+imports (for example `await import(absolutePath)`), while every other file stays
+fail closed. Static import edges from the exempted file are still resolved
+normally.
 
 ## Development
 

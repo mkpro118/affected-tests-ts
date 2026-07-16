@@ -42,6 +42,12 @@ pub trait View {
     #[must_use]
     fn dynamic_imports(&self) -> UnknownDynamicImportBehavior;
 
+    /// Returns globs whose files are exempt from the fail-closed dynamic import policy.
+    #[must_use]
+    fn dynamic_import_ignore(&self) -> &[Pattern] {
+        &[]
+    }
+
     /// Returns TypeScript path mappings used by import resolution.
     #[must_use]
     fn path_mappings(&self) -> &[PathMapping] {
@@ -154,6 +160,7 @@ pub struct Config {
     test_patterns: Box<[TestFilePattern]>,
     global_invalidators: Box<[Pattern]>,
     dynamic_imports: UnknownDynamicImportBehavior,
+    dynamic_import_ignore: Box<[Pattern]>,
     path_mappings: Box<[PathMapping]>,
     base_url: Option<Box<str>>,
 }
@@ -166,6 +173,7 @@ pub struct ResolvedConfig {
     test_patterns: Box<[TestFilePattern]>,
     global_invalidators: Box<[Pattern]>,
     dynamic_imports: UnknownDynamicImportBehavior,
+    dynamic_import_ignore: Box<[Pattern]>,
     path_mappings: Box<[PathMapping]>,
     base_url: Option<Box<str>>,
 }
@@ -189,6 +197,10 @@ impl View for ResolvedConfig {
 
     fn dynamic_imports(&self) -> UnknownDynamicImportBehavior {
         self.dynamic_imports
+    }
+
+    fn dynamic_import_ignore(&self) -> &[Pattern] {
+        self.dynamic_import_ignore.as_ref()
     }
 
     fn path_mappings(&self) -> &[PathMapping] {
@@ -268,6 +280,21 @@ where
     test_patterns_match(config.test_patterns(), path)
 }
 
+/// Reports whether a file is exempt from the fail-closed dynamic import policy.
+///
+/// # Errors
+///
+/// Returns an error when a configured glob cannot be compiled.
+pub fn matches_dynamic_import_ignore<C>(
+    config: &C,
+    path: &roots::RootRelativePath,
+) -> failure::Result<bool>
+where
+    C: View,
+{
+    patterns_match(config.dynamic_import_ignore(), path)
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct FileConfig {
@@ -276,6 +303,7 @@ struct FileConfig {
     test_patterns: Option<Box<[Box<str>]>>,
     global_invalidators: Option<Box<[Box<str>]>>,
     dynamic_imports: Option<UnknownDynamicImportBehavior>,
+    dynamic_import_ignore: Option<Box<[Box<str>]>>,
     compiler_options: Option<CompilerOptions>,
 }
 
@@ -317,6 +345,7 @@ impl From<TypeScriptConfig> for FileConfig {
             test_patterns: None,
             global_invalidators: None,
             dynamic_imports: None,
+            dynamic_import_ignore: None,
             compiler_options: config.compiler_options,
         }
     }
@@ -349,6 +378,9 @@ impl FileConfig {
             dynamic_imports: self
                 .dynamic_imports
                 .unwrap_or(UnknownDynamicImportBehavior::FailClosed),
+            dynamic_import_ignore: compile_patterns(
+                self.dynamic_import_ignore.unwrap_or_default().as_ref(),
+            )?,
             path_mappings: compile_path_mappings(compiler_options)?,
             base_url,
         })
@@ -707,20 +739,16 @@ mod tests {
 
         // Custom config files let repositories describe their own test naming
         // and fail-closed files without touching host filesystem state.
-        assert!(
-            super::matches_test_file(
-                &config,
-                &roots::RootRelativePath::try_from("app/button.check.ts").unwrap()
-            )
-            .unwrap()
-        );
-        assert!(
-            super::matches_global_invalidator(
-                &config,
-                &roots::RootRelativePath::try_from("workspace.json").unwrap()
-            )
-            .unwrap()
-        );
+        assert!(super::matches_test_file(
+            &config,
+            &roots::RootRelativePath::try_from("app/button.check.ts").unwrap()
+        )
+        .unwrap());
+        assert!(super::matches_global_invalidator(
+            &config,
+            &roots::RootRelativePath::try_from("workspace.json").unwrap()
+        )
+        .unwrap());
         assert_eq!(
             super::View::dynamic_imports(&config),
             super::UnknownDynamicImportBehavior::Ignore,
@@ -861,25 +889,59 @@ mod tests {
     }
 
     #[test]
-    fn loaded_base_url_without_paths_is_exposed_for_resolution() {
+    fn dynamic_import_ignore_globs_are_parsed_and_matched() {
         let request = super::LoadRequest {
             file_system: FixtureFileSystem {
                 content: Some(Box::<str>::from(
                     r#"{
-  "compilerOptions": {
-    "baseUrl": "src"
-  }
+  "dynamicImports": "failClosed",
+  "dynamicImportIgnore": ["src/graphql-contract/**", "src/legacy/loader.ts"]
 }"#,
                 )),
             },
-            config_path: Some(roots::RootRelativePath::try_from("tsconfig.json").unwrap()),
+            config_path: Some(roots::RootRelativePath::try_from("affected-tests.json").unwrap()),
         };
 
         let config = super::load(request).unwrap();
 
-        // Repositories often use baseUrl without explicit paths; resolver needs
-        // that local root without forcing package imports into the graph.
-        assert_eq!(super::View::base_url(&config), Some("src"));
-        assert_eq!(super::View::path_mappings(&config), &[]);
+        // The ignore list lets a repo quarantine files whose dynamic imports are
+        // genuinely unresolvable, without abandoning fail-closed everywhere else.
+        assert_eq!(
+            super::View::dynamic_imports(&config),
+            super::UnknownDynamicImportBehavior::FailClosed,
+        );
+        assert!(super::matches_dynamic_import_ignore(
+            &config,
+            &roots::RootRelativePath::try_from("src/graphql-contract/collector.ts").unwrap(),
+        )
+        .unwrap());
+        assert!(super::matches_dynamic_import_ignore(
+            &config,
+            &roots::RootRelativePath::try_from("src/legacy/loader.ts").unwrap(),
+        )
+        .unwrap());
+        assert!(!super::matches_dynamic_import_ignore(
+            &config,
+            &roots::RootRelativePath::try_from("src/router.ts").unwrap(),
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn dynamic_import_ignore_defaults_to_empty() {
+        let config = super::load(super::LoadRequest {
+            file_system: FixtureFileSystem::default(),
+            config_path: None,
+        })
+        .unwrap();
+
+        // Without configuration nothing is exempted, so fail-closed stays the
+        // default behavior for every file.
+        assert!(super::View::dynamic_import_ignore(&config).is_empty());
+        assert!(!super::matches_dynamic_import_ignore(
+            &config,
+            &roots::RootRelativePath::try_from("src/graphql-contract/collector.ts").unwrap(),
+        )
+        .unwrap());
     }
 }
