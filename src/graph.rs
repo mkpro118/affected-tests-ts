@@ -128,6 +128,7 @@ where
             probe: self.probe.clone(),
             importer: path.clone(),
             static_specifiers: imports.static_specifiers,
+            mock_specifiers: imports.mock_specifiers,
             dynamic_specifiers: imports.dynamic_specifiers,
             failure_mode: self.failure_mode,
         })
@@ -196,6 +197,7 @@ struct ResolveImportsRequest<C, M, P> {
     probe: P,
     importer: roots::RootRelativePath,
     static_specifiers: Box<[roots::ImportSpecifier]>,
+    mock_specifiers: Box<[roots::ImportSpecifier]>,
     dynamic_specifiers: Box<[roots::ImportSpecifier]>,
     failure_mode: ImportFailureMode,
 }
@@ -249,15 +251,28 @@ where
         probe,
         importer,
         static_specifiers,
+        mock_specifiers,
         dynamic_specifiers,
         failure_mode,
     } = request;
     let mut dependencies = Vec::<roots::RootRelativePath>::new();
     let mut external_packages = Vec::<Box<str>>::new();
-    for specifier in static_specifiers
+    for (specifier, is_mock) in static_specifiers
         .into_vec()
         .into_iter()
-        .chain(dynamic_specifiers.into_vec())
+        .map(|specifier| (specifier, false))
+        .chain(
+            dynamic_specifiers
+                .into_vec()
+                .into_iter()
+                .map(|specifier| (specifier, false)),
+        )
+        .chain(
+            mock_specifiers
+                .into_vec()
+                .into_iter()
+                .map(|specifier| (specifier, true)),
+        )
     {
         let outcome = resolver.resolve(modules::ResolveRequest {
             config: config.clone(),
@@ -275,7 +290,7 @@ where
             }
             modules::Outcome::Unresolved(specifier) => {
                 let ignored = settings::matches_unresolved_import_ignore(&config, &importer)?;
-                if failure_mode == ImportFailureMode::Strict && !ignored {
+                if failure_mode == ImportFailureMode::Strict && !ignored && !is_mock {
                     return Err(failure::AppError::UnresolvedLocalImport {
                         importer,
                         specifier,

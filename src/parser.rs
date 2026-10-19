@@ -33,6 +33,8 @@ pub struct Request<R> {
 pub struct Imports {
     /// Static import and re-export specifiers.
     pub static_specifiers: Box<[roots::ImportSpecifier]>,
+    /// Module substitution specifiers from `mock.module`-style calls.
+    pub mock_specifiers: Box<[roots::ImportSpecifier]>,
     /// String-literal dynamic import specifiers.
     pub dynamic_specifiers: Box<[roots::ImportSpecifier]>,
     /// Dynamic import expressions that cannot be represented as graph edges.
@@ -104,10 +106,9 @@ fn collect_program_imports(program: &ast::Program<'_>) -> failure::Result<Import
 
     let mut mock_collector = MockModuleCollector::default();
     mock_collector.visit_program(program);
-    static_specifiers.extend(mock_collector.specifiers);
-
     Ok(Imports {
         static_specifiers: static_specifiers.into_boxed_slice(),
+        mock_specifiers: mock_collector.specifiers.into_boxed_slice(),
         dynamic_specifiers: dynamic_collector.dynamic_specifiers.into_boxed_slice(),
         unsupported_dynamic_imports: dynamic_collector
             .unsupported_dynamic_imports
@@ -1112,6 +1113,10 @@ declare namespace AppTypes {
 
         assert_eq!(
             imports.static_specifiers,
+            Box::<[roots::ImportSpecifier]>::from([]),
+        );
+        assert_eq!(
+            imports.mock_specifiers,
             Box::<[roots::ImportSpecifier]>::from([specifier("../database/client")]),
         );
     }
@@ -1129,6 +1134,10 @@ declare namespace AppTypes {
 
         assert_eq!(
             imports.static_specifiers,
+            Box::<[roots::ImportSpecifier]>::from([]),
+        );
+        assert_eq!(
+            imports.mock_specifiers,
             Box::<[roots::ImportSpecifier]>::from([specifier("../database/client")]),
         );
     }
