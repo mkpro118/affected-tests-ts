@@ -14,6 +14,7 @@ use crate::impact;
 use crate::package_scope;
 use crate::presentation;
 use crate::roots;
+use crate::settings;
 use crate::vcs;
 use crate::vcs::ChangeSetView;
 
@@ -142,14 +143,17 @@ fn optional_format(format: Option<cli::Format>) -> Option<presentation::Format> 
 
 fn run_selection(request: SelectionCommand) -> failure::Result<RunOutcome> {
     let repository_path = repository_root()?;
-    let repository = vcs::ProcessRepository::for_root(repository_path.clone());
+    let pipeline = app_pipeline::build(repository_path.clone())?;
+    let repository = vcs::ProcessRepository::for_root_ignoring(
+        repository_path,
+        settings::View::out_of_workspace_ignore(&pipeline.config),
+    )?;
     let changes = vcs::changed_files(vcs::ChangesRequest {
         repository: repository.clone(),
         base: request.base.clone(),
         head: request.head.clone(),
         worktree: request.worktree,
     })?;
-    let pipeline = app_pipeline::build(repository_path)?;
     let classifier = app_pipeline::Classifier::try_new(&pipeline.config)?;
     let selection_changes = match &pipeline.graph {
         Ok(graph) => package_scope::scoped_changes(&package_scope::ScopeRequest {

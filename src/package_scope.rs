@@ -110,7 +110,13 @@ where
     };
 
     let changed_packages = match request.change.path.as_str() {
-        PACKAGE_JSON => changed_package_json_packages(old_text.as_ref(), new_text.as_ref()),
+        PACKAGE_JSON => changed_package_json_packages(
+            old_text.as_ref(),
+            new_text.as_ref(),
+            request
+                .config
+                .map_or(&[], settings::View::package_json_ignore),
+        ),
         BUN_LOCK => changed_bun_lock_packages(old_text.as_ref(), new_text.as_ref()),
         _ => None,
     };
@@ -118,7 +124,7 @@ where
         return Ok(None);
     };
     if changed_packages.is_empty() {
-        return Ok(None);
+        return Ok(Some(Box::default()));
     }
     if changed_packages.iter().any(|package| {
         request.config.map_or_else(
@@ -170,7 +176,11 @@ fn is_global_risk_package(package: &str) -> bool {
     )
 }
 
-fn changed_package_json_packages(old_text: &str, new_text: &str) -> Option<BTreeSet<Box<str>>> {
+fn changed_package_json_packages(
+    old_text: &str,
+    new_text: &str,
+    ignored_fields: &[Box<str>],
+) -> Option<BTreeSet<Box<str>>> {
     let old_json = serde_json::from_str::<Value>(old_text).ok()?;
     let new_json = serde_json::from_str::<Value>(new_text).ok()?;
     let old_object = old_json.as_object()?;
@@ -180,7 +190,12 @@ fn changed_package_json_packages(old_text: &str, new_text: &str) -> Option<BTree
         if DEPENDENCY_SECTIONS.contains(&key.as_str()) {
             continue;
         }
-        if old_object.get(key) != new_object.get(key) {
+        if !json_values_equal_ignoring(
+            old_object.get(key),
+            new_object.get(key),
+            key,
+            ignored_fields,
+        ) {
             return None;
         }
     }
@@ -194,6 +209,33 @@ fn changed_package_json_packages(old_text: &str, new_text: &str) -> Option<BTree
     }
 
     Some(changed)
+}
+
+fn json_values_equal_ignoring(
+    old: Option<&Value>,
+    new: Option<&Value>,
+    path: &str,
+    ignored_fields: &[Box<str>],
+) -> bool {
+    if ignored_fields
+        .iter()
+        .any(|ignored| ignored.as_ref() == path)
+    {
+        return true;
+    }
+    match (old, new) {
+        (Some(Value::Object(old)), Some(Value::Object(new))) => {
+            old.keys().chain(new.keys()).all(|key| {
+                json_values_equal_ignoring(
+                    old.get(key),
+                    new.get(key),
+                    &format!("{path}.{key}"),
+                    ignored_fields,
+                )
+            })
+        }
+        _ => old == new,
+    }
 }
 
 fn changed_dependency_section_packages(
@@ -441,6 +483,23 @@ mod tests {
                 ),
             ]),
         }
+    }
+
+    #[test]
+    fn package_json_ignores_only_configured_nested_script_fields() {
+        let changed = super::changed_package_json_packages(
+            r#"{"name":"app","scripts":{"data:reset:ar":"prisma db push"}}"#,
+            r#"{"name":"app","scripts":{"data:reset:ar":"prisma db push --legacy"}}"#,
+            &[Box::<str>::from("scripts.data:reset:ar")],
+        );
+        assert_eq!(changed, Some(std::collections::BTreeSet::new()));
+
+        let unrelated = super::changed_package_json_packages(
+            r#"{"name":"app","scripts":{"test":"bun test","data:reset:ar":"x"}}"#,
+            r#"{"name":"app","scripts":{"test":"bun test --coverage","data:reset:ar":"y"}}"#,
+            &[Box::<str>::from("scripts.data:reset:ar")],
+        );
+        assert_eq!(unrelated, None);
     }
 
     #[test]

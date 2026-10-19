@@ -94,6 +94,15 @@ fn assert_success(output: &process::Output) {
     );
 }
 
+fn assert_full_run(output: &process::Output) {
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "full-suite selection must exit 2: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
 struct WriteFixtureFileRequest<'a> {
     repository_path: &'a path::Path,
     relative_path: &'a str,
@@ -290,6 +299,65 @@ fn create_changed_monorepo_workspace(name: &str) -> path::PathBuf {
         &["add", "apps/web/src/value.ts"],
     ));
     commit_fixture_change(&repository_path, "Change web source value");
+
+    repository_path.join("apps/web")
+}
+
+fn create_changed_sibling_package_workspace(name: &str) -> path::PathBuf {
+    let repository_path = fixture_repo_path(name);
+
+    if repository_path.exists() {
+        fs::remove_dir_all(&repository_path).unwrap();
+    }
+
+    fs::create_dir_all(&repository_path).unwrap();
+    assert_success(&run_command(
+        process::Command::new("git")
+            .arg("init")
+            .arg("-b")
+            .arg("main")
+            .arg(&repository_path),
+    ));
+    write_fixture_file(&WriteFixtureFileRequest {
+        repository_path: &repository_path,
+        relative_path: "apps/web/affected-tests.json",
+        content: r#"{"sourceIncludes":["src/**/*.ts","tests/**/*.ts"],"testPatterns":["tests/**/*.test.ts"],"excludes":[],"globalInvalidators":[]}"#,
+    });
+    write_fixture_file(&WriteFixtureFileRequest {
+        repository_path: &repository_path,
+        relative_path: "apps/web/src/main.ts",
+        content: "import { value } from '@workspace/shared';\nexport { value };\n",
+    });
+    write_fixture_file(&WriteFixtureFileRequest {
+        repository_path: &repository_path,
+        relative_path: "apps/web/tests/main.test.ts",
+        content: "import { value } from '../src/main';\nvoid value;\n",
+    });
+    write_fixture_file(&WriteFixtureFileRequest {
+        repository_path: &repository_path,
+        relative_path: "packages/shared/index.ts",
+        content: "export const value = 1;\n",
+    });
+    assert_git_success(&run_git(&repository_path, &["add", "."]));
+    commit_fixture_change(&repository_path, "Add app and sibling package");
+    assert_git_success(&run_git(
+        &repository_path,
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    ));
+    assert_git_success(&run_git(
+        &repository_path,
+        &["checkout", "-b", "feature/change-shared"],
+    ));
+    write_fixture_file(&WriteFixtureFileRequest {
+        repository_path: &repository_path,
+        relative_path: "packages/shared/index.ts",
+        content: "export const value = 2;\n",
+    });
+    assert_git_success(&run_git(
+        &repository_path,
+        &["add", "packages/shared/index.ts"],
+    ));
+    commit_fixture_change(&repository_path, "Change sibling package");
 
     repository_path.join("apps/web")
 }
@@ -696,6 +764,61 @@ fn package_scoping_engages_when_run_from_a_subdirectory_workspace() {
 }
 
 #[test]
+fn binary_fails_closed_when_a_changed_file_is_outside_the_workspace() {
+    let workspace_path = create_changed_sibling_package_workspace("sibling-workspace-change");
+    let output = run_affected_tests(CommandRequest {
+        repository_path: &workspace_path,
+        args: &[
+            "--base",
+            "origin/main",
+            "--head",
+            "HEAD",
+            "--format",
+            "json",
+        ],
+    });
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("outside the invocation workspace"),
+        "out-of-workspace changes must not be reported as a confident empty selection: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(!stdout(&output).contains(r#""status":"none""#));
+}
+
+#[test]
+fn worktree_mode_fails_closed_for_untracked_files_outside_the_workspace() {
+    let workspace_path = create_changed_sibling_package_workspace("untracked-sibling-workspace");
+    let repository_path = workspace_path.parent().unwrap().parent().unwrap();
+    write_fixture_file(&WriteFixtureFileRequest {
+        repository_path,
+        relative_path: "packages/shared/untracked.ts",
+        content: "export const helper = true;\n",
+    });
+    let output = run_affected_tests(CommandRequest {
+        repository_path: &workspace_path,
+        args: &[
+            "--base",
+            "HEAD",
+            "--head",
+            "HEAD",
+            "--worktree",
+            "--format",
+            "json",
+        ],
+    });
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("outside the invocation workspace"),
+        "untracked sibling files must not be omitted from worktree selection: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(!stdout(&output).contains(r#""status":"none""#));
+}
+
+#[test]
 fn binary_lockfile_change_fails_closed_instead_of_aborting_on_non_utf8() {
     let workspace_path = create_changed_subdir_binary_lockfile("binary-lockfile");
     let output = run_affected_tests(CommandRequest {
@@ -711,12 +834,9 @@ fn binary_lockfile_change_fails_closed_instead_of_aborting_on_non_utf8() {
     });
 
     // A binary lockfile is not valid UTF-8, so reading it back through
-    // `git show` must not crash the run with a UTF-8 decoding error.
-    assert!(
-        output.status.success(),
-        "binary lockfile run failed: {}",
-        String::from_utf8_lossy(&output.stderr),
-    );
+    // `git show` must not crash the run with a UTF-8 decoding error. Full
+    // selection is a successful analysis with its own documented exit code.
+    assert_full_run(&output);
     // It cannot be parsed for scoping, so it stays a global invalidator and
     // the run fails closed to the full suite.
     let content = stdout(&output);
@@ -788,13 +908,13 @@ fn binary_handles_real_git_renames_deletes_and_global_invalidators() {
         ],
     });
 
-    // Source renames, deletes, and invalidators fail closed because the current
-    // graph cannot prove base-graph safety for old source paths.
+    // A pure source rename should use the current graph without forcing the
+    // full suite; deletions and global invalidators remain fail-closed.
     assert_success(&rename_output);
-    assert_success(&delete_output);
-    assert_success(&invalidator_output);
-    assert!(stdout(&rename_output).contains(r#""status":"full""#));
-    assert!(stdout(&rename_output).contains("deleted source file: src/value.ts"));
+    assert_full_run(&delete_output);
+    assert_full_run(&invalidator_output);
+    assert!(stdout(&rename_output).contains(r#""status":"partial""#));
+    assert!(stdout(&rename_output).contains("tests/value.test.ts"));
     assert!(stdout(&delete_output).contains(r#""status":"full""#));
     assert!(stdout(&delete_output).contains("deleted source file"));
     assert!(stdout(&invalidator_output).contains(r#""status":"full""#));

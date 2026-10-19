@@ -351,15 +351,12 @@ where
 }
 
 fn candidate_paths(candidate_base: &str) -> Box<[Box<str>]> {
+    if let Some(candidates) = typescript_runtime_extension_candidates(candidate_base) {
+        return candidates;
+    }
+
     let mut paths = Vec::<Box<str>>::new();
     paths.push(Box::<str>::from(candidate_base));
-    if let Some(stem) = typescript_runtime_extension_stem(candidate_base) {
-        paths.extend(
-            [".ts", ".tsx", ".mts", ".cts"]
-                .into_iter()
-                .map(|extension| Box::<str>::from(format!("{stem}{extension}"))),
-        );
-    }
     paths.extend(
         [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx"]
             .into_iter()
@@ -381,10 +378,24 @@ fn candidate_paths(candidate_base: &str) -> Box<[Box<str>]> {
     paths.into_boxed_slice()
 }
 
-fn typescript_runtime_extension_stem(candidate_base: &str) -> Option<&str> {
-    [".js", ".jsx", ".mjs", ".cjs"]
-        .into_iter()
-        .find_map(|extension| candidate_base.strip_suffix(extension))
+fn typescript_runtime_extension_candidates(candidate_base: &str) -> Option<Box<[Box<str>]>> {
+    let substitutions: &[(&str, &[&str])] = &[
+        (".js", &[".ts", ".tsx", ".js", ".jsx"]),
+        (".jsx", &[".tsx", ".jsx"]),
+        (".mjs", &[".mts", ".mjs"]),
+        (".cjs", &[".cts", ".cjs"]),
+    ];
+
+    substitutions
+        .iter()
+        .find_map(|(runtime_extension, source_extensions)| {
+            candidate_base.strip_suffix(runtime_extension).map(|stem| {
+                source_extensions
+                    .iter()
+                    .map(|extension| Box::<str>::from(format!("{stem}{extension}")))
+                    .collect()
+            })
+        })
 }
 
 fn normalize_candidate_path(candidate_path: &str) -> Option<Box<str>> {
@@ -580,6 +591,15 @@ mod tests {
             existing_paths: BTreeSet::from([
                 path("src/components/button.tsx"),
                 path("src/components/explicit.ts"),
+                path("src/components/explicit.js"),
+                path("src/components/explicit.tsx"),
+                path("src/components/explicit.jsx"),
+                path("src/components/explicit.mts"),
+                path("src/components/explicit.mjs"),
+                path("src/components/explicit.cts"),
+                path("src/components/explicit.cjs"),
+                path("src/components/wrong-extension.mts"),
+                path("src/components/wrong-extension.js"),
                 path("src/components/menu/index.ts"),
                 path("src/shared/date.ts"),
             ]),
@@ -609,6 +629,28 @@ mod tests {
             super::import(explicit_extension_request).unwrap(),
             super::Outcome::Resolved(path("src/components/explicit.ts")),
         );
+
+        for (specifier_text, expected) in [
+            ("../components/explicit.jsx", "src/components/explicit.tsx"),
+            ("../components/explicit.mjs", "src/components/explicit.mts"),
+            ("../components/explicit.cjs", "src/components/explicit.cts"),
+            (
+                "../components/wrong-extension.js",
+                "src/components/wrong-extension.js",
+            ),
+        ] {
+            let request = super::ResolveRequest {
+                config: FixtureConfig::default(),
+                probe: probe.clone(),
+                importer: path("src/pages/home.tsx"),
+                specifier: specifier(specifier_text),
+            };
+
+            assert_eq!(
+                super::import(request).unwrap(),
+                super::Outcome::Resolved(path(expected)),
+            );
+        }
 
         let index_request = super::ResolveRequest {
             config: FixtureConfig::default(),

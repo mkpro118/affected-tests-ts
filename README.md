@@ -132,17 +132,34 @@ In CI, run `affected-tests-ts` from the TypeScript project root after checkout
 and dependency installation. For monorepos, this is usually the app/package
 directory, not necessarily the repository root.
 
-The safest CI pattern is:
+A full-suite result is a completed selection and exits with status `2`; partial
+and empty results exit `0`. Other non-zero statuses mean selection failed, so the
+example falls back to the full suite. Capture paths as an array to preserve spaces
+and glob characters in filenames:
 
-```sh
-tests="$(affected-tests-ts --base origin/main --head HEAD)"
+```bash
+set +e
+test_paths="$(affected-tests-ts --base origin/main --head HEAD)"
+selector_status=$?
+set -e
 
-if [ -z "$tests" ]; then
+if [[ "$selector_status" -ne 0 && "$selector_status" -ne 2 ]]; then
+  echo "Affected-test selection failed; running the full suite." >&2
+  bun test
+  exit $?
+fi
+
+tests=()
+if [[ -n "$test_paths" ]]; then
+  mapfile -t tests <<< "$test_paths"
+fi
+
+if ((${#tests[@]} == 0)); then
   echo "No affected tests"
   exit 0
 fi
 
-bun test $tests
+bun test "${tests[@]}"
 ```
 
 For pull request workflows, make sure the base ref exists locally. Many CI
@@ -213,13 +230,15 @@ affected-tests-ts --worktree --format plain
 The tool returns a full selection when precision would be unsafe. Examples:
 
 - A global invalidator changed and could not be scoped.
-- A source file was deleted or renamed in a way that needs a base graph.
+- A source file was deleted and the old graph is unavailable.
 - A local import cannot be resolved.
 - A non-literal dynamic import is configured to fail closed.
 - Dependency metadata changed in a way that cannot be classified safely.
 
 Shell output still prints runnable test paths for a full result. A diagnostic
-reason is written to stderr so scripts can keep stdout as paths only.
+reason is written to stderr so scripts can keep stdout as paths only. A completed
+full-suite selection exits with code `2`; a partial or empty selection exits `0`.
+Exit code `1` means selection failed before producing a valid result.
 
 ## Package Metadata Changes
 
@@ -250,6 +269,7 @@ Example `affected-tests.json`:
 
 ```json
 {
+  "schemaVersion": 1,
   "sourceIncludes": ["src/**/*.ts", "src/**/*.tsx"],
   "excludes": ["node_modules/**", "dist/**", "build/**", ".next/**"],
   "testPatterns": ["**/*.test.ts", "**/*.test.tsx"],
@@ -261,6 +281,8 @@ Example `affected-tests.json`:
   ],
   "dynamicImports": "failClosed",
   "dynamicImportIgnore": ["src/graphql-contract/**"],
+  "unresolvedImportIgnore": ["src/legacy/**"],
+  "globalRiskPackages": ["react", "next", "typescript"],
   "compilerOptions": {
     "baseUrl": ".",
     "paths": {
@@ -279,13 +301,25 @@ Defaults:
 - Global invalidators: `package.json`, `bun.lock`, `bun.lockb`, `tsconfig.json`
 - Dynamic imports: `failClosed`
 - Dynamic import ignore: empty (no files exempted)
+- Unresolved import ignore: empty (no files exempted)
+- Global risk packages: the built-in conservative list
 
-`dynamicImportIgnore` is a list of globs matched against the importing file's
-root-relative path. When `dynamicImports` is `failClosed`, a file matching one of
-these globs is exempt from the full-suite trigger for its own unresolvable dynamic
-imports (for example `await import(absolutePath)`), while every other file stays
-fail closed. Static import edges from the exempted file are still resolved
-normally.
+`schemaVersion` is optional; when provided, it must match the schema version
+supported by the binary. This makes config/binary mismatches explicit.
+
+`dynamicImportIgnore` and `unresolvedImportIgnore` are lists of globs matched
+against the importing file's root-relative path. When `dynamicImports` is
+`failClosed`, a file matching `dynamicImportIgnore` is exempt from the full-suite
+trigger for its own unresolvable dynamic imports (for example
+`await import(absolutePath)`), while every other file stays fail closed. Static
+import edges from the exempted file are still resolved normally.
+
+`unresolvedImportIgnore` quarantines known stale local import specifiers while
+unresolved imports in other files remain fail-closed.
+
+`globalRiskPackages` replaces the built-in high-risk dependency list when set to a
+non-empty array, allowing repositories to tune which dependency changes force a
+full suite. An empty or omitted list keeps the built-in list.
 
 ## Development
 
