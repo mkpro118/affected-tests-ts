@@ -102,6 +102,10 @@ fn collect_program_imports(program: &ast::Program<'_>) -> failure::Result<Import
         return Err(error);
     }
 
+    let mut mock_collector = MockModuleCollector::default();
+    mock_collector.visit_program(program);
+    static_specifiers.extend(mock_collector.specifiers);
+
     Ok(Imports {
         static_specifiers: static_specifiers.into_boxed_slice(),
         dynamic_specifiers: dynamic_collector.dynamic_specifiers.into_boxed_slice(),
@@ -109,6 +113,66 @@ fn collect_program_imports(program: &ast::Program<'_>) -> failure::Result<Import
             .unsupported_dynamic_imports
             .into_boxed_slice(),
     })
+}
+
+#[derive(Default)]
+struct MockModuleCollector {
+    specifiers: Vec<roots::ImportSpecifier>,
+}
+
+impl<'a> Visit<'a> for MockModuleCollector {
+    fn visit_call_expression(&mut self, call: &ast::CallExpression<'a>) {
+        if is_mock_module_callee(&call.callee)
+            && let Some(ast::Argument::StringLiteral(argument)) = call.arguments.first()
+        {
+            self.push_specifier(argument.value.as_str());
+        } else if is_scoped_mock_callee(&call.callee)
+            && let Some(ast::Argument::ObjectExpression(options)) = call.arguments.first()
+        {
+            for property in &options.properties {
+                let ast::ObjectPropertyKind::ObjectProperty(property) = property else {
+                    continue;
+                };
+                let ast::PropertyKey::StaticIdentifier(key) = &property.key else {
+                    continue;
+                };
+                if key.name.as_str() == "specifier"
+                    && let ast::Expression::StringLiteral(argument) = &property.value
+                {
+                    self.push_specifier(argument.value.as_str());
+                }
+            }
+        }
+
+        walk::walk_call_expression(self, call);
+    }
+}
+
+impl MockModuleCollector {
+    fn push_specifier(&mut self, value: &str) {
+        if let Ok(specifier) = roots::ImportSpecifier::try_from(value) {
+            self.specifiers.push(specifier);
+        }
+    }
+}
+
+fn is_mock_module_callee(expression: &ast::Expression<'_>) -> bool {
+    let ast::Expression::StaticMemberExpression(member) = expression else {
+        return false;
+    };
+    let ast::Expression::Identifier(object) = &member.object else {
+        return false;
+    };
+
+    object.name.as_str() == "mock" && member.property.name.as_str() == "module"
+}
+
+fn is_scoped_mock_callee(expression: &ast::Expression<'_>) -> bool {
+    let ast::Expression::Identifier(identifier) = expression else {
+        return false;
+    };
+
+    identifier.name.as_str() == "installScopedModuleMock"
 }
 
 fn collect_static_statement_imports(
@@ -1033,6 +1097,40 @@ declare namespace AppTypes {
             Box::<[roots::ImportSpecifier]>::from([])
         );
         assert_eq!(imports.unsupported_dynamic_imports, Box::from([]));
+    }
+
+    #[test]
+    fn mock_module_string_literal_creates_a_static_dependency_edge() {
+        let request = super::Request {
+            reader: FixtureReader {
+                source: "mock.module('../database/client', () => ({ default: {} }));",
+            },
+            path: path("src/tests/client.test.ts"),
+        };
+
+        let imports = super::imports(request).unwrap();
+
+        assert_eq!(
+            imports.static_specifiers,
+            Box::<[roots::ImportSpecifier]>::from([specifier("../database/client")]),
+        );
+    }
+
+    #[test]
+    fn scoped_module_mock_specifier_creates_a_static_dependency_edge() {
+        let request = super::Request {
+            reader: FixtureReader {
+                source: r#"installScopedModuleMock({ specifier: "../database/client" });"#,
+            },
+            path: path("src/tests/client.test.ts"),
+        };
+
+        let imports = super::imports(request).unwrap();
+
+        assert_eq!(
+            imports.static_specifiers,
+            Box::<[roots::ImportSpecifier]>::from([specifier("../database/client")]),
+        );
     }
 
     #[test]

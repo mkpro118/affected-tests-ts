@@ -353,6 +353,13 @@ where
 fn candidate_paths(candidate_base: &str) -> Box<[Box<str>]> {
     let mut paths = Vec::<Box<str>>::new();
     paths.push(Box::<str>::from(candidate_base));
+    if let Some(stem) = typescript_runtime_extension_stem(candidate_base) {
+        paths.extend(
+            [".ts", ".tsx", ".mts", ".cts"]
+                .into_iter()
+                .map(|extension| Box::<str>::from(format!("{stem}{extension}"))),
+        );
+    }
     paths.extend(
         [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx"]
             .into_iter()
@@ -372,6 +379,12 @@ fn candidate_paths(candidate_base: &str) -> Box<[Box<str>]> {
     );
 
     paths.into_boxed_slice()
+}
+
+fn typescript_runtime_extension_stem(candidate_base: &str) -> Option<&str> {
+    [".js", ".jsx", ".mjs", ".cjs"]
+        .into_iter()
+        .find_map(|extension| candidate_base.strip_suffix(extension))
 }
 
 fn normalize_candidate_path(candidate_path: &str) -> Option<Box<str>> {
@@ -566,6 +579,7 @@ mod tests {
         let probe = FixtureProbe {
             existing_paths: BTreeSet::from([
                 path("src/components/button.tsx"),
+                path("src/components/explicit.ts"),
                 path("src/components/menu/index.ts"),
                 path("src/shared/date.ts"),
             ]),
@@ -582,6 +596,18 @@ mod tests {
         assert_eq!(
             super::import(relative_request).unwrap(),
             super::Outcome::Resolved(path("src/components/button.tsx")),
+        );
+
+        let explicit_extension_request = super::ResolveRequest {
+            config: FixtureConfig::default(),
+            probe: probe.clone(),
+            importer: path("src/pages/home.tsx"),
+            specifier: specifier("../components/explicit.js"),
+        };
+
+        assert_eq!(
+            super::import(explicit_extension_request).unwrap(),
+            super::Outcome::Resolved(path("src/components/explicit.ts")),
         );
 
         let index_request = super::ResolveRequest {

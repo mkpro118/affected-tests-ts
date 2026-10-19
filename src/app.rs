@@ -34,6 +34,15 @@ pub struct Request {
     pub terminal_mode: TerminalMode,
 }
 
+/// Process outcome after a command has rendered successfully.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RunOutcome {
+    /// The command selected a partial or empty result.
+    Complete,
+    /// The selector deliberately fell back to the full suite.
+    FullRun,
+}
+
 struct SelectionCommand {
     base: Box<str>,
     head: Box<str>,
@@ -65,7 +74,7 @@ struct SelectionFormatRequest {
 /// # Errors
 ///
 /// Returns an error when any pipeline phase or renderer fails.
-pub fn run() -> failure::Result<()> {
+pub fn run() -> failure::Result<RunOutcome> {
     let terminal_mode = if io::stdout().is_terminal() {
         TerminalMode::Interactive
     } else {
@@ -83,7 +92,7 @@ pub fn run() -> failure::Result<()> {
 /// # Errors
 ///
 /// Returns an error when any pipeline phase or renderer fails.
-pub fn run_with(request: Request) -> failure::Result<()> {
+pub fn run_with(request: Request) -> failure::Result<RunOutcome> {
     let Request {
         args,
         terminal_mode,
@@ -91,12 +100,14 @@ pub fn run_with(request: Request) -> failure::Result<()> {
     match &args.command {
         Some(cli::Command::Graph) => run_graph(GraphCommand {
             format: optional_format(args.format).unwrap_or(presentation::Format::Plain),
-        }),
+        })
+        .map(|()| RunOutcome::Complete),
         Some(cli::Command::Explain { test }) => run_explain(ExplainCommand {
             format: optional_format(args.format).unwrap_or(presentation::Format::Plain),
             path: roots::RootRelativePath::try_from(test.clone())?,
             terminal_mode,
-        }),
+        })
+        .map(|()| RunOutcome::Complete),
         None => run_selection(SelectionCommand {
             base: args
                 .base
@@ -129,7 +140,7 @@ fn optional_format(format: Option<cli::Format>) -> Option<presentation::Format> 
     format.map(app_render::format)
 }
 
-fn run_selection(request: SelectionCommand) -> failure::Result<()> {
+fn run_selection(request: SelectionCommand) -> failure::Result<RunOutcome> {
     let repository_path = repository_root()?;
     let repository = vcs::ProcessRepository::for_root(repository_path.clone());
     let changes = vcs::changed_files(vcs::ChangesRequest {
@@ -147,6 +158,7 @@ fn run_selection(request: SelectionCommand) -> failure::Result<()> {
             head: request.head.as_ref(),
             changes: &changes,
             graph,
+            config: Some(&pipeline.config),
         })?,
         Err(_error) => changes,
     };
@@ -162,6 +174,11 @@ fn run_selection(request: SelectionCommand) -> failure::Result<()> {
         files: &pipeline.files,
         include_reasons: request.include_reasons,
     });
+    let outcome = if matches!(contract, crate::contract::CommandResult::Full(_)) {
+        RunOutcome::FullRun
+    } else {
+        RunOutcome::Complete
+    };
 
     app_render::render(app_render::Command {
         format: request.format,
@@ -170,7 +187,9 @@ fn run_selection(request: SelectionCommand) -> failure::Result<()> {
         base: request.base,
         head: request.head,
         changed_file_count: selection_changes.files().len(),
-    })
+    })?;
+
+    Ok(outcome)
 }
 
 fn run_graph(request: GraphCommand) -> failure::Result<()> {

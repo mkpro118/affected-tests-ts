@@ -276,6 +276,7 @@ mod tests {
                 reason: Box::<str>::from(
                     "unresolved local import `@/constants/timezones` in: src/utils/date.ts",
                 ),
+                reason_code: contract::FullReasonCode::UnresolvedLocalImport,
                 tests: Box::from([Box::<str>::from("src/utils/date.test.ts")]),
             }));
 

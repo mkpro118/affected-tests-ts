@@ -274,7 +274,8 @@ where
                 }
             }
             modules::Outcome::Unresolved(specifier) => {
-                if failure_mode == ImportFailureMode::Strict {
+                let ignored = settings::matches_unresolved_import_ignore(&config, &importer)?;
+                if failure_mode == ImportFailureMode::Strict && !ignored {
                     return Err(failure::AppError::UnresolvedLocalImport {
                         importer,
                         specifier,

@@ -326,6 +326,7 @@ mod tests {
     fn shell_output_emits_only_partial_test_path_lines() {
         let full_result = contract::CommandResult::Full(contract::FullResult {
             reason: Box::<str>::from("global invalidator changed"),
+            reason_code: contract::FullReasonCode::GlobalInvalidator,
             tests: Box::from([Box::<str>::from("src/full-suite.test.ts")]),
         });
         let none_result = contract::CommandResult::None(contract::NoneResult {

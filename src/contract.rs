@@ -32,8 +32,24 @@ pub struct PartialResult {
 pub struct FullResult {
     /// User-facing fail-closed reason.
     pub reason: Box<str>,
+    /// Stable machine-readable fail-closed reason.
+    pub reason_code: FullReasonCode,
     /// Stable sorted test paths to run for the full suite.
     pub tests: Box<[Box<str>]>,
+}
+
+/// Stable machine-readable reasons for full-suite selection.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FullReasonCode {
+    /// A configured global invalidator changed.
+    GlobalInvalidator,
+    /// A source file was deleted or renamed.
+    DeletedSourceFile,
+    /// A local import could not be resolved.
+    UnresolvedLocalImport,
+    /// A dynamic import could not be followed.
+    UnknownDynamicImport,
 }
 
 /// Contract emitted when no tests are affected.

@@ -200,15 +200,13 @@ where
         if change.status == vcs::ChangedFileStatus::Deleted && classifier.is_source(&change.path) {
             return Some(FullReason::DeletedSourceFile(change.path.clone()));
         }
-        if let Some(previous_path) = &change.previous_path {
-            if classifier.is_global_invalidator(previous_path) {
-                return Some(FullReason::GlobalInvalidator(previous_path.clone()));
-            }
-            if change.status == vcs::ChangedFileStatus::Renamed
-                && classifier.is_source(previous_path)
-            {
-                return Some(FullReason::DeletedSourceFile(previous_path.clone()));
-            }
+        // The old and new paths are both traced below. The base graph is
+        // unavailable here, but treating every rename as a deletion turns
+        // ordinary moves into silent full-suite runs.
+        if let Some(previous_path) = &change.previous_path
+            && classifier.is_global_invalidator(previous_path)
+        {
+            return Some(FullReason::GlobalInvalidator(previous_path.clone()));
         }
     }
 
@@ -672,20 +670,23 @@ mod tests {
     }
 
     #[test]
-    fn renamed_source_paths_fail_closed_for_old_path_without_base_graph() {
+    fn renamed_source_paths_trace_old_and_new_names_without_full_run() {
         let result = super::select(request(Box::from([renamed(
             "src/file-a.ts",
             "src/file-renamed.ts",
         )])))
         .unwrap();
 
-        // Without a base graph, the selector cannot prove what depended on the
-        // old source path, so source renames conservatively run the full suite.
         assert_eq!(
             result,
-            super::AffectedResult::Full(super::FullReason::DeletedSourceFile(path(
-                "src/file-a.ts"
-            ))),
+            super::AffectedResult::Partial(super::PartialDecision {
+                tests: Box::from([path("src/file-a.test.ts")]),
+                reasons: Box::from([super::SelectionReason {
+                    changed_file: path("src/file-a.ts"),
+                    test_file: path("src/file-a.test.ts"),
+                    path: Box::from([path("src/file-a.ts"), path("src/file-a.test.ts")]),
+                }]),
+            }),
         );
     }
 

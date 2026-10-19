@@ -251,6 +251,7 @@ mod tests {
             ]),
             result: contract::CommandResult::Full(contract::FullResult {
                 reason: Box::<str>::from("global invalidator changed: tsconfig.json"),
+                reason_code: contract::FullReasonCode::GlobalInvalidator,
                 tests: Box::from([
                     Box::<str>::from("src/accounts.test.ts"),
                     Box::<str>::from("src/button.test.tsx"),

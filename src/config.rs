@@ -10,6 +10,8 @@ use crate::roots;
 
 type RawPathMappings = BTreeMap<Box<str>, Box<[Box<str>]>>;
 
+const CONFIG_SCHEMA_VERSION: u32 = 1;
+
 /// Behavior used when a dynamic import cannot be statically resolved.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -48,6 +50,12 @@ pub trait View {
         &[]
     }
 
+    /// Returns globs whose unresolved local imports are exempt from fail-closed selection.
+    #[must_use]
+    fn unresolved_import_ignore(&self) -> &[Pattern] {
+        &[]
+    }
+
     /// Returns TypeScript path mappings used by import resolution.
     #[must_use]
     fn path_mappings(&self) -> &[PathMapping] {
@@ -58,6 +66,12 @@ pub trait View {
     #[must_use]
     fn base_url(&self) -> Option<&str> {
         None
+    }
+
+    /// Returns package names whose changes require a full suite.
+    #[must_use]
+    fn global_risk_packages(&self) -> &[Box<str>] {
+        &[]
     }
 }
 
@@ -161,8 +175,10 @@ pub struct Config {
     global_invalidators: Box<[Pattern]>,
     dynamic_imports: UnknownDynamicImportBehavior,
     dynamic_import_ignore: Box<[Pattern]>,
+    unresolved_import_ignore: Box<[Pattern]>,
     path_mappings: Box<[PathMapping]>,
     base_url: Option<Box<str>>,
+    global_risk_packages: Box<[Box<str>]>,
 }
 
 /// Resolved configuration consumed by discovery, resolution, and selection.
@@ -174,8 +190,10 @@ pub struct ResolvedConfig {
     global_invalidators: Box<[Pattern]>,
     dynamic_imports: UnknownDynamicImportBehavior,
     dynamic_import_ignore: Box<[Pattern]>,
+    unresolved_import_ignore: Box<[Pattern]>,
     path_mappings: Box<[PathMapping]>,
     base_url: Option<Box<str>>,
+    global_risk_packages: Box<[Box<str>]>,
 }
 
 impl View for ResolvedConfig {
@@ -203,12 +221,20 @@ impl View for ResolvedConfig {
         self.dynamic_import_ignore.as_ref()
     }
 
+    fn unresolved_import_ignore(&self) -> &[Pattern] {
+        self.unresolved_import_ignore.as_ref()
+    }
+
     fn path_mappings(&self) -> &[PathMapping] {
         self.path_mappings.as_ref()
     }
 
     fn base_url(&self) -> Option<&str> {
         self.base_url.as_deref()
+    }
+
+    fn global_risk_packages(&self) -> &[Box<str>] {
+        self.global_risk_packages.as_ref()
     }
 }
 
@@ -295,16 +321,34 @@ where
     patterns_match(config.dynamic_import_ignore(), path)
 }
 
+/// Reports whether a file is exempt from the fail-closed unresolved-import policy.
+///
+/// # Errors
+///
+/// Returns an error when a configured glob cannot be compiled.
+pub fn matches_unresolved_import_ignore<C>(
+    config: &C,
+    path: &roots::RootRelativePath,
+) -> failure::Result<bool>
+where
+    C: View,
+{
+    patterns_match(config.unresolved_import_ignore(), path)
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct FileConfig {
+    schema_version: Option<u32>,
     source_includes: Option<Box<[Box<str>]>>,
     excludes: Option<Box<[Box<str>]>>,
     test_patterns: Option<Box<[Box<str>]>>,
     global_invalidators: Option<Box<[Box<str>]>>,
     dynamic_imports: Option<UnknownDynamicImportBehavior>,
     dynamic_import_ignore: Option<Box<[Box<str>]>>,
+    unresolved_import_ignore: Option<Box<[Box<str>]>>,
     compiler_options: Option<CompilerOptions>,
+    global_risk_packages: Option<Box<[Box<str>]>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -336,6 +380,7 @@ struct TypeScriptConfig {
 impl From<TypeScriptConfig> for FileConfig {
     fn from(config: TypeScriptConfig) -> Self {
         Self {
+            schema_version: None,
             source_includes: config
                 .include
                 .map(|patterns| normalize_typescript_includes(patterns.as_ref())),
@@ -346,13 +391,27 @@ impl From<TypeScriptConfig> for FileConfig {
             global_invalidators: None,
             dynamic_imports: None,
             dynamic_import_ignore: None,
+            unresolved_import_ignore: None,
             compiler_options: config.compiler_options,
+            global_risk_packages: None,
         }
     }
 }
 
 impl FileConfig {
     fn resolve(self) -> failure::Result<ResolvedConfig> {
+        if let Some(schema_version) = self.schema_version
+            && schema_version != CONFIG_SCHEMA_VERSION
+        {
+            return Err(failure::AppError::Config {
+                message: format!(
+                    "unsupported affected-tests config schema version {schema_version}; \
+                     supported version is {CONFIG_SCHEMA_VERSION}"
+                )
+                .into_boxed_str(),
+            });
+        }
+
         let source_includes = self
             .source_includes
             .unwrap_or_else(default_source_include_values);
@@ -381,8 +440,12 @@ impl FileConfig {
             dynamic_import_ignore: compile_patterns(
                 self.dynamic_import_ignore.unwrap_or_default().as_ref(),
             )?,
+            unresolved_import_ignore: compile_patterns(
+                self.unresolved_import_ignore.unwrap_or_default().as_ref(),
+            )?,
             path_mappings: compile_path_mappings(compiler_options)?,
             base_url,
+            global_risk_packages: self.global_risk_packages.unwrap_or_default(),
         })
     }
 }
@@ -739,16 +802,20 @@ mod tests {
 
         // Custom config files let repositories describe their own test naming
         // and fail-closed files without touching host filesystem state.
-        assert!(super::matches_test_file(
-            &config,
-            &roots::RootRelativePath::try_from("app/button.check.ts").unwrap()
-        )
-        .unwrap());
-        assert!(super::matches_global_invalidator(
-            &config,
-            &roots::RootRelativePath::try_from("workspace.json").unwrap()
-        )
-        .unwrap());
+        assert!(
+            super::matches_test_file(
+                &config,
+                &roots::RootRelativePath::try_from("app/button.check.ts").unwrap()
+            )
+            .unwrap()
+        );
+        assert!(
+            super::matches_global_invalidator(
+                &config,
+                &roots::RootRelativePath::try_from("workspace.json").unwrap()
+            )
+            .unwrap()
+        );
         assert_eq!(
             super::View::dynamic_imports(&config),
             super::UnknownDynamicImportBehavior::Ignore,
@@ -910,21 +977,27 @@ mod tests {
             super::View::dynamic_imports(&config),
             super::UnknownDynamicImportBehavior::FailClosed,
         );
-        assert!(super::matches_dynamic_import_ignore(
-            &config,
-            &roots::RootRelativePath::try_from("src/graphql-contract/collector.ts").unwrap(),
-        )
-        .unwrap());
-        assert!(super::matches_dynamic_import_ignore(
-            &config,
-            &roots::RootRelativePath::try_from("src/legacy/loader.ts").unwrap(),
-        )
-        .unwrap());
-        assert!(!super::matches_dynamic_import_ignore(
-            &config,
-            &roots::RootRelativePath::try_from("src/router.ts").unwrap(),
-        )
-        .unwrap());
+        assert!(
+            super::matches_dynamic_import_ignore(
+                &config,
+                &roots::RootRelativePath::try_from("src/graphql-contract/collector.ts").unwrap(),
+            )
+            .unwrap()
+        );
+        assert!(
+            super::matches_dynamic_import_ignore(
+                &config,
+                &roots::RootRelativePath::try_from("src/legacy/loader.ts").unwrap(),
+            )
+            .unwrap()
+        );
+        assert!(
+            !super::matches_dynamic_import_ignore(
+                &config,
+                &roots::RootRelativePath::try_from("src/router.ts").unwrap(),
+            )
+            .unwrap()
+        );
     }
 
     #[test]
@@ -937,11 +1010,73 @@ mod tests {
 
         // Without configuration nothing is exempted, so fail-closed stays the
         // default behavior for every file.
-        assert!(super::View::dynamic_import_ignore(&config).is_empty());
-        assert!(!super::matches_dynamic_import_ignore(
-            &config,
-            &roots::RootRelativePath::try_from("src/graphql-contract/collector.ts").unwrap(),
-        )
-        .unwrap());
+        assert_eq!(super::View::dynamic_import_ignore(&config), []);
+        assert!(
+            !super::matches_dynamic_import_ignore(
+                &config,
+                &roots::RootRelativePath::try_from("src/graphql-contract/collector.ts").unwrap(),
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn unresolved_import_ignore_globs_are_parsed_and_matched() {
+        let config = super::load(super::LoadRequest {
+            file_system: FixtureFileSystem {
+                content: Some(Box::<str>::from(
+                    r#"{"unresolvedImportIgnore":["src/legacy/**"]}"#,
+                )),
+            },
+            config_path: Some(roots::RootRelativePath::try_from("affected-tests.json").unwrap()),
+        })
+        .unwrap();
+
+        assert!(
+            super::matches_unresolved_import_ignore(
+                &config,
+                &roots::RootRelativePath::try_from("src/legacy/loader.ts").unwrap(),
+            )
+            .unwrap()
+        );
+        assert!(
+            !super::matches_unresolved_import_ignore(
+                &config,
+                &roots::RootRelativePath::try_from("src/router.ts").unwrap(),
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn unsupported_affected_tests_schema_version_reports_compatibility_error() {
+        let result = super::load(super::LoadRequest {
+            file_system: FixtureFileSystem {
+                content: Some(Box::<str>::from(r#"{"schemaVersion":2}"#)),
+            },
+            config_path: Some(roots::RootRelativePath::try_from("affected-tests.json").unwrap()),
+        });
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("unsupported affected-tests config schema version 2"));
+        assert!(error.contains("supported version is 1"));
+    }
+
+    #[test]
+    fn configured_global_risk_packages_replace_the_conservative_default() {
+        let config = super::load(super::LoadRequest {
+            file_system: FixtureFileSystem {
+                content: Some(Box::<str>::from(
+                    r#"{"globalRiskPackages":["internal-runtime"]}"#,
+                )),
+            },
+            config_path: Some(roots::RootRelativePath::try_from("affected-tests.json").unwrap()),
+        })
+        .unwrap();
+
+        assert_eq!(
+            super::View::global_risk_packages(&config),
+            &[Box::<str>::from("internal-runtime")],
+        );
     }
 }

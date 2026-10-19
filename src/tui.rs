@@ -1158,6 +1158,7 @@ mod tests {
             shared_work: shared_work(),
             result: Some(contract::CommandResult::Full(contract::FullResult {
                 reason: Box::<str>::from("global invalidator changed: tsconfig.json"),
+                reason_code: contract::FullReasonCode::GlobalInvalidator,
                 tests: Box::from([Box::<str>::from("src/file-a.test.ts")]),
             })),
         };

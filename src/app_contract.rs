@@ -40,6 +40,7 @@ pub fn command_result(request: SelectionOutputRequest<'_>) -> contract::CommandR
         impact::AffectedResult::Full(reason) => {
             contract::CommandResult::Full(contract::FullResult {
                 reason: full_reason_text(&reason),
+                reason_code: full_reason_code(&reason),
                 tests: path_strings(request.files.tests.as_ref()),
             })
         }
@@ -139,6 +140,19 @@ fn full_reason_text(reason: &impact::FullReason) -> Box<str> {
         } => format!("unresolved local import `{specifier}` in: {importer}").into_boxed_str(),
         impact::FullReason::UnknownDynamicImport(path) => {
             format!("unknown dynamic import in: {path}").into_boxed_str()
+        }
+    }
+}
+
+const fn full_reason_code(reason: &impact::FullReason) -> contract::FullReasonCode {
+    match reason {
+        impact::FullReason::GlobalInvalidator(_) => contract::FullReasonCode::GlobalInvalidator,
+        impact::FullReason::DeletedSourceFile(_) => contract::FullReasonCode::DeletedSourceFile,
+        impact::FullReason::UnresolvedLocalImport { .. } => {
+            contract::FullReasonCode::UnresolvedLocalImport
+        }
+        impact::FullReason::UnknownDynamicImport(_) => {
+            contract::FullReasonCode::UnknownDynamicImport
         }
     }
 }

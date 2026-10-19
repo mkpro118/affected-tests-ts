@@ -9,7 +9,8 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     match affected_tests_ts::app::run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(affected_tests_ts::app::RunOutcome::Complete) => ExitCode::SUCCESS,
+        Ok(affected_tests_ts::app::RunOutcome::FullRun) => ExitCode::from(2),
         Err(error) => {
             eprintln!("{error}");
             ExitCode::FAILURE

@@ -7,6 +7,7 @@ use serde_json::Value;
 use crate::dependencies;
 use crate::failure;
 use crate::roots;
+use crate::settings;
 use crate::vcs;
 use crate::vcs::ChangeSetView;
 
@@ -21,7 +22,7 @@ const BUN_LOCK: &str = "bun.lock";
 const BUN_LOCKB: &str = "bun.lockb";
 
 /// Request for replacing package metadata changes with scoped importer changes.
-pub struct ScopeRequest<'a, R, G> {
+pub struct ScopeRequest<'a, R, G, C> {
     /// Git repository used to read metadata at base and head.
     pub repository: &'a R,
     /// Base revision for metadata comparison.
@@ -32,15 +33,20 @@ pub struct ScopeRequest<'a, R, G> {
     pub changes: &'a vcs::ChangeSet,
     /// Dependency graph containing external-package importers.
     pub graph: &'a G,
+    /// Optional configuration override for high-risk package names.
+    pub config: Option<&'a C>,
 }
 
 /// Returns a change set where safely scoped package metadata changes become
 /// importer-file changes. Unscoped metadata changes are kept as-is so normal
 /// global invalidator behavior remains fail-closed.
-pub fn scoped_changes<R, G>(request: &ScopeRequest<'_, R, G>) -> failure::Result<vcs::ChangeSet>
+pub fn scoped_changes<R, G, C>(
+    request: &ScopeRequest<'_, R, G, C>,
+) -> failure::Result<vcs::ChangeSet>
 where
     R: vcs::GitRepository,
     G: dependencies::GraphView,
+    C: settings::View,
 {
     let mut files = Vec::<vcs::ChangedFile>::new();
 
@@ -56,6 +62,7 @@ where
             head: request.head,
             change,
             graph: request.graph,
+            config: request.config,
         })? {
             Some(importers) => files.extend(importers.into_vec().into_iter().map(importer_change)),
             None => files.push(change.clone()),
@@ -71,20 +78,22 @@ where
     })
 }
 
-struct PackageImportersRequest<'a, R, G> {
+struct PackageImportersRequest<'a, R, G, C> {
     repository: &'a R,
     base: &'a str,
     head: &'a str,
     change: &'a vcs::ChangedFile,
     graph: &'a G,
+    config: Option<&'a C>,
 }
 
-fn scoped_package_importers<R, G>(
-    request: &PackageImportersRequest<'_, R, G>,
+fn scoped_package_importers<R, G, C>(
+    request: &PackageImportersRequest<'_, R, G, C>,
 ) -> failure::Result<Option<Box<[roots::RootRelativePath]>>>
 where
     R: vcs::GitRepository,
     G: dependencies::GraphView,
+    C: settings::View,
 {
     if request.change.status != vcs::ChangedFileStatus::Modified {
         return Ok(None);
@@ -111,10 +120,18 @@ where
     if changed_packages.is_empty() {
         return Ok(None);
     }
-    if changed_packages
-        .iter()
-        .any(|package| is_global_risk_package(package))
-    {
+    if changed_packages.iter().any(|package| {
+        request.config.map_or_else(
+            || is_global_risk_package(package),
+            |config| {
+                config.global_risk_packages().is_empty() && is_global_risk_package(package)
+                    || config
+                        .global_risk_packages()
+                        .iter()
+                        .any(|risk_package| risk_package.as_ref() == package.as_ref())
+            },
+        )
+    }) {
         return Ok(None);
     }
 
@@ -128,6 +145,29 @@ where
     }
 
     Ok(Some(importers))
+}
+
+fn is_global_risk_package(package: &str) -> bool {
+    matches!(
+        package,
+        "bun"
+            | "next"
+            | "react"
+            | "react-dom"
+            | "typescript"
+            | "tsx"
+            | "prisma"
+            | "@prisma/client"
+            | "@types/node"
+            | "@types/react"
+            | "@types/react-dom"
+            | "jest"
+            | "bun-plugin-tailwind"
+            | "tailwindcss"
+            | "webpack"
+            | "vite"
+            | "eslint"
+    )
 }
 
 fn changed_package_json_packages(old_text: &str, new_text: &str) -> Option<BTreeSet<Box<str>>> {
@@ -293,29 +333,6 @@ fn package_aliases(package: &str) -> BTreeSet<Box<str>> {
     packages
 }
 
-fn is_global_risk_package(package: &str) -> bool {
-    matches!(
-        package,
-        "bun"
-            | "next"
-            | "react"
-            | "react-dom"
-            | "typescript"
-            | "tsx"
-            | "prisma"
-            | "@prisma/client"
-            | "@types/node"
-            | "@types/react"
-            | "@types/react-dom"
-            | "jest"
-            | "bun-plugin-tailwind"
-            | "tailwindcss"
-            | "webpack"
-            | "vite"
-            | "eslint"
-    )
-}
-
 const fn importer_change(path: roots::RootRelativePath) -> vcs::ChangedFile {
     vcs::ChangedFile {
         status: vcs::ChangedFileStatus::Modified,
@@ -450,6 +467,7 @@ mod tests {
             head: "head",
             changes: &changes,
             graph: &graph,
+            config: None::<&crate::settings::ResolvedConfig>,
         })
         .unwrap();
 
@@ -474,6 +492,7 @@ mod tests {
             head: "head",
             changes: &changes,
             graph: &graph,
+            config: None::<&crate::settings::ResolvedConfig>,
         })
         .unwrap();
 
@@ -504,6 +523,7 @@ mod tests {
             head: "head",
             changes: &changes,
             graph: &graph,
+            config: None::<&crate::settings::ResolvedConfig>,
         })
         .unwrap();
 
@@ -530,6 +550,7 @@ mod tests {
             head: "head",
             changes: &changes,
             graph: &graph,
+            config: None::<&crate::settings::ResolvedConfig>,
         })
         .unwrap();
 
@@ -564,6 +585,7 @@ mod tests {
             head: "head",
             changes: &changes,
             graph: &graph,
+            config: None::<&crate::settings::ResolvedConfig>,
         })
         .unwrap();
 
