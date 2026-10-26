@@ -80,13 +80,6 @@ pub trait View {
     fn package_json_ignore(&self) -> &[Box<str>] {
         &[]
     }
-
-    /// Returns repository-root paths outside an invocation subdirectory that
-    /// are irrelevant to that workspace.
-    #[must_use]
-    fn out_of_workspace_ignore(&self) -> &[Pattern] {
-        &[]
-    }
 }
 
 /// Glob pattern text retained as a typed configuration value.
@@ -194,7 +187,6 @@ pub struct Config {
     base_url: Option<Box<str>>,
     global_risk_packages: Box<[Box<str>]>,
     package_json_ignore: Box<[Box<str>]>,
-    out_of_workspace_ignore: Box<[Pattern]>,
 }
 
 /// Resolved configuration consumed by discovery, resolution, and selection.
@@ -211,7 +203,6 @@ pub struct ResolvedConfig {
     base_url: Option<Box<str>>,
     global_risk_packages: Box<[Box<str>]>,
     package_json_ignore: Box<[Box<str>]>,
-    out_of_workspace_ignore: Box<[Pattern]>,
 }
 
 impl View for ResolvedConfig {
@@ -257,10 +248,6 @@ impl View for ResolvedConfig {
 
     fn package_json_ignore(&self) -> &[Box<str>] {
         self.package_json_ignore.as_ref()
-    }
-
-    fn out_of_workspace_ignore(&self) -> &[Pattern] {
-        self.out_of_workspace_ignore.as_ref()
     }
 }
 
@@ -376,7 +363,6 @@ struct FileConfig {
     compiler_options: Option<CompilerOptions>,
     global_risk_packages: Option<Box<[Box<str>]>>,
     package_json_ignore: Option<Box<[Box<str>]>>,
-    out_of_workspace_ignore: Option<Box<[Box<str>]>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -423,7 +409,6 @@ impl From<TypeScriptConfig> for FileConfig {
             compiler_options: config.compiler_options,
             global_risk_packages: None,
             package_json_ignore: None,
-            out_of_workspace_ignore: None,
         }
     }
 }
@@ -477,9 +462,6 @@ impl FileConfig {
             base_url,
             global_risk_packages: self.global_risk_packages.unwrap_or_default(),
             package_json_ignore: self.package_json_ignore.unwrap_or_default(),
-            out_of_workspace_ignore: compile_patterns(
-                self.out_of_workspace_ignore.unwrap_or_default().as_ref(),
-            )?,
         })
     }
 }
@@ -1083,11 +1065,11 @@ mod tests {
     }
 
     #[test]
-    fn package_json_and_workspace_ignores_are_loaded_from_config() {
+    fn package_json_ignores_are_loaded_from_config() {
         let config = super::load(super::LoadRequest {
             file_system: FixtureFileSystem {
                 content: Some(Box::<str>::from(
-                    r#"{"packageJsonIgnore":["scripts.data:reset:ar"],"outOfWorkspaceIgnore":["**/*.md"]}"#,
+                    r#"{"packageJsonIgnore":["scripts.data:reset:ar"]}"#,
                 )),
             },
             config_path: Some(roots::RootRelativePath::try_from("affected-tests.json").unwrap()),
@@ -1097,13 +1079,6 @@ mod tests {
         assert_eq!(
             super::View::package_json_ignore(&config),
             [Box::<str>::from("scripts.data:reset:ar")],
-        );
-        assert_eq!(
-            super::View::out_of_workspace_ignore(&config)
-                .iter()
-                .map(super::Pattern::as_str)
-                .collect::<Vec<_>>(),
-            ["**/*.md"],
         );
     }
 

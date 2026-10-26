@@ -3,8 +3,6 @@
 use std::path;
 use std::process;
 
-use globset::{Glob, GlobSet, GlobSetBuilder};
-
 use crate::failure;
 use crate::roots;
 
@@ -72,7 +70,7 @@ pub trait GitRepository {
     /// Returns an error when Git cannot compute the worktree diff.
     fn diff_worktree_name_status(&self) -> failure::Result<Box<str>>;
 
-    /// Lists untracked files in the repository so out-of-workspace changes can fail closed.
+    /// Lists untracked files in the invocation workspace.
     ///
     /// # Errors
     ///
@@ -95,159 +93,13 @@ pub trait GitRepository {
 #[derive(Clone, Debug)]
 pub struct ProcessRepository {
     working_directory: Box<str>,
-    ignored_out_of_workspace: GlobSet,
 }
 
 impl ProcessRepository {
     /// Creates a Git adapter rooted at the invocation workspace.
     #[must_use]
     pub const fn for_root(working_directory: Box<str>) -> Self {
-        Self {
-            working_directory,
-            ignored_out_of_workspace: GlobSet::empty(),
-        }
-    }
-
-    /// Creates a Git adapter that ignores configured repository-root paths
-    /// outside a subdirectory invocation workspace.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when an ignore glob is invalid.
-    pub fn for_root_ignoring(
-        working_directory: Box<str>,
-        patterns: &[crate::settings::Pattern],
-    ) -> failure::Result<Self> {
-        let mut builder = GlobSetBuilder::new();
-        for pattern in patterns {
-            let glob = Glob::new(pattern.as_str()).map_err(|error| failure::AppError::Config {
-                message: format!("invalid out-of-workspace ignore glob: {error}").into_boxed_str(),
-            })?;
-            builder.add(glob);
-        }
-        let ignored_out_of_workspace =
-            builder.build().map_err(|error| failure::AppError::Config {
-                message: format!("invalid out-of-workspace ignore globs: {error}").into_boxed_str(),
-            })?;
-        Ok(Self {
-            working_directory,
-            ignored_out_of_workspace,
-        })
-    }
-}
-
-impl ProcessRepository {
-    fn workspace_prefix(&self) -> failure::Result<Box<str>> {
-        let output = process::Command::new("git")
-            .arg("-C")
-            .arg(path::Path::new(self.working_directory.as_ref()))
-            .arg("rev-parse")
-            .arg("--show-prefix")
-            .output()
-            .map_err(|error| failure::AppError::Git {
-                message: format!("failed to identify Git workspace prefix: {error}")
-                    .into_boxed_str(),
-            })?;
-        if !output.status.success() {
-            return Err(failure::AppError::Git {
-                message: git_failure_message(output.stderr.as_slice()),
-            });
-        }
-        let prefix = String::from_utf8(output.stdout).map_err(|error| failure::AppError::Git {
-            message: format!("Git workspace prefix was not UTF-8: {error}").into_boxed_str(),
-        })?;
-        let prefix = prefix.trim_end_matches(['\r', '\n']);
-        if prefix.is_empty() {
-            Ok(Box::from(""))
-        } else {
-            Ok(format!("{}/", prefix.trim_end_matches('/')).into_boxed_str())
-        }
-    }
-
-    fn workspace_relative_name_status(&self, output: &str) -> failure::Result<Box<str>> {
-        let prefix = self.workspace_prefix()?;
-        let mut normalized = String::new();
-        for line in output.lines() {
-            if line.is_empty() {
-                continue;
-            }
-            let (status, paths) = line.split_once('\t').ok_or_else(|| git_parse_error(line))?;
-            let mut normalized_paths = Vec::<&str>::new();
-            for path in paths.split('\t') {
-                let workspace_path = self.workspace_relative_path(path, prefix.as_ref())?;
-                if !workspace_path.is_empty() {
-                    normalized_paths.push(workspace_path);
-                }
-            }
-            if normalized_paths.is_empty() {
-                continue;
-            }
-            let normalized_status = if normalized_paths.len() == paths.split('\t').count() {
-                status.to_owned()
-            } else if status.starts_with('R') || status.starts_with('C') {
-                // A rename crossing the workspace boundary becomes an add or
-                // deletion inside this workspace, respectively.
-                if paths
-                    .split('\t')
-                    .next()
-                    .is_some_and(|old| !prefix.is_empty() && !old.starts_with(prefix.as_ref()))
-                {
-                    "A".to_owned()
-                } else {
-                    "D".to_owned()
-                }
-            } else {
-                status.to_owned()
-            };
-            normalized.push_str(&normalized_status);
-            for path in normalized_paths {
-                normalized.push('\t');
-                normalized.push_str(path);
-            }
-            normalized.push('\n');
-        }
-
-        Ok(normalized.into_boxed_str())
-    }
-
-    fn workspace_relative_untracked_files(&self, output: &str) -> failure::Result<Box<str>> {
-        let prefix = self.workspace_prefix()?;
-        let mut normalized = String::new();
-        for path in output.lines().filter(|path| !path.is_empty()) {
-            let workspace_path = self.workspace_relative_path(path, prefix.as_ref())?;
-            if workspace_path.is_empty() {
-                continue;
-            }
-            normalized.push_str(workspace_path);
-            normalized.push('\n');
-        }
-
-        Ok(normalized.into_boxed_str())
-    }
-
-    fn workspace_relative_path<'a>(&self, path: &'a str, prefix: &str) -> failure::Result<&'a str> {
-        let workspace_path = if prefix.is_empty() {
-            path
-        } else {
-            match path.strip_prefix(prefix) {
-                Some(workspace_path) => workspace_path,
-                None if self.ignored_out_of_workspace.is_match(path) => return Ok(""),
-                None => {
-                    return Err(failure::AppError::Git {
-                        message: format!(
-                            "changed path `{path}` is outside the invocation workspace `{}`",
-                            prefix.trim_end_matches('/')
-                        )
-                        .into_boxed_str(),
-                    });
-                }
-            }
-        };
-        if workspace_path.is_empty() {
-            return Err(git_parse_error(path));
-        }
-
-        Ok(workspace_path)
+        Self { working_directory }
     }
 }
 
@@ -261,7 +113,10 @@ impl GitRepository for ProcessRepository {
             .arg("--name-status")
             .arg("--find-renames")
             .arg("--diff-filter=ACMRTD")
+            .arg("--relative")
             .arg(range)
+            .arg("--")
+            .arg(".")
             .output()
             .map_err(|error| failure::AppError::Git {
                 message: format!("failed to execute git diff: {error}").into_boxed_str(),
@@ -276,7 +131,7 @@ impl GitRepository for ProcessRepository {
         let output = String::from_utf8(output.stdout).map_err(|error| failure::AppError::Git {
             message: format!("git diff output was not UTF-8: {error}").into_boxed_str(),
         })?;
-        self.workspace_relative_name_status(&output)
+        Ok(output.into_boxed_str())
     }
 
     fn diff_worktree_name_status(&self) -> failure::Result<Box<str>> {
@@ -287,7 +142,10 @@ impl GitRepository for ProcessRepository {
             .arg("--name-status")
             .arg("--find-renames")
             .arg("--diff-filter=ACMRTD")
+            .arg("--relative")
             .arg("HEAD")
+            .arg("--")
+            .arg(".")
             .output()
             .map_err(|error| failure::AppError::Git {
                 message: format!("failed to execute git worktree diff: {error}").into_boxed_str(),
@@ -302,7 +160,7 @@ impl GitRepository for ProcessRepository {
         let output = String::from_utf8(output.stdout).map_err(|error| failure::AppError::Git {
             message: format!("git worktree diff output was not UTF-8: {error}").into_boxed_str(),
         })?;
-        self.workspace_relative_name_status(&output)
+        Ok(output.into_boxed_str())
     }
 
     fn untracked_files(&self) -> failure::Result<Box<str>> {
@@ -312,9 +170,8 @@ impl GitRepository for ProcessRepository {
             .arg("ls-files")
             .arg("--others")
             .arg("--exclude-standard")
-            .arg("--full-name")
             .arg("--")
-            .arg(":(top)")
+            .arg(".")
             .output()
             .map_err(|error| failure::AppError::Git {
                 message: format!("failed to execute git ls-files: {error}").into_boxed_str(),
@@ -329,7 +186,7 @@ impl GitRepository for ProcessRepository {
         let output = String::from_utf8(output.stdout).map_err(|error| failure::AppError::Git {
             message: format!("git ls-files output was not UTF-8: {error}").into_boxed_str(),
         })?;
-        self.workspace_relative_untracked_files(&output)
+        Ok(output.into_boxed_str())
     }
 
     fn file_at_revision(
@@ -571,25 +428,6 @@ mod tests {
 
     fn path(value: &str) -> roots::RootRelativePath {
         roots::RootRelativePath::try_from(value).unwrap()
-    }
-
-    #[test]
-    fn configured_out_of_workspace_paths_are_ignored_but_code_paths_still_fail_closed() {
-        let patterns = [crate::settings::Pattern::try_from("**/*.md").unwrap()];
-        let repository =
-            super::ProcessRepository::for_root_ignoring(Box::<str>::from("."), &patterns).unwrap();
-
-        assert_eq!(
-            repository
-                .workspace_relative_path(".claude/skills/example/SKILL.md", "apps/web/")
-                .unwrap(),
-            "",
-        );
-        assert!(
-            repository
-                .workspace_relative_path("packages/core/src/index.ts", "apps/web/")
-                .is_err()
-        );
     }
 
     #[test]

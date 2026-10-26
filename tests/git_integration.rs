@@ -764,7 +764,7 @@ fn package_scoping_engages_when_run_from_a_subdirectory_workspace() {
 }
 
 #[test]
-fn binary_fails_closed_when_a_changed_file_is_outside_the_workspace() {
+fn binary_ignores_changed_files_outside_the_workspace() {
     let workspace_path = create_changed_sibling_package_workspace("sibling-workspace-change");
     let output = run_affected_tests(CommandRequest {
         repository_path: &workspace_path,
@@ -778,17 +778,16 @@ fn binary_fails_closed_when_a_changed_file_is_outside_the_workspace() {
         ],
     });
 
-    assert_eq!(output.status.code(), Some(1));
+    assert_success(&output);
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("outside the invocation workspace"),
-        "out-of-workspace changes must not be reported as a confident empty selection: {}",
-        String::from_utf8_lossy(&output.stderr),
+        stdout(&output).contains(r#""status":"none""#),
+        "out-of-workspace changes must not affect this workspace: {}",
+        stdout(&output),
     );
-    assert!(!stdout(&output).contains(r#""status":"none""#));
 }
 
 #[test]
-fn worktree_mode_fails_closed_for_untracked_files_outside_the_workspace() {
+fn worktree_mode_ignores_untracked_files_outside_the_workspace() {
     let workspace_path = create_changed_sibling_package_workspace("untracked-sibling-workspace");
     let repository_path = workspace_path.parent().unwrap().parent().unwrap();
     write_fixture_file(&WriteFixtureFileRequest {
@@ -809,13 +808,12 @@ fn worktree_mode_fails_closed_for_untracked_files_outside_the_workspace() {
         ],
     });
 
-    assert_eq!(output.status.code(), Some(1));
+    assert_success(&output);
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("outside the invocation workspace"),
-        "untracked sibling files must not be omitted from worktree selection: {}",
-        String::from_utf8_lossy(&output.stderr),
+        stdout(&output).contains(r#""status":"none""#),
+        "untracked sibling files must not affect this workspace: {}",
+        stdout(&output),
     );
-    assert!(!stdout(&output).contains(r#""status":"none""#));
 }
 
 #[test]
