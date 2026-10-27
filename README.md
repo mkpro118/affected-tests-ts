@@ -9,7 +9,13 @@ the full discovered test suite.
 
 ## Install
 
-Install from Git:
+Download a prebuilt binary for Linux x86_64/aarch64, macOS Intel/Apple Silicon,
+or Windows x86_64 from the [GitHub Releases page](https://github.com/mkpro118/affected-tests-ts/releases).
+Each release includes a platform archive and `SHA256SUMS` for verification. Extract
+the archive and place `affected-tests-ts` (or `affected-tests-ts.exe`) on your
+`PATH`.
+
+To build from source instead:
 
 ```sh
 cargo install --git https://github.com/mkpro118/affected-tests-ts
