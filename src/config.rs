@@ -1097,7 +1097,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_global_risk_packages_replace_the_conservative_default() {
+    fn configured_global_risk_packages_are_explicit_opt_ins() {
         let config = super::load(super::LoadRequest {
             file_system: FixtureFileSystem {
                 content: Some(Box::<str>::from(

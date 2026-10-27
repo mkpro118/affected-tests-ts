@@ -308,7 +308,7 @@ Defaults:
 - Dynamic imports: `failClosed`
 - Dynamic import ignore: empty (no files exempted)
 - Unresolved import ignore: empty (no files exempted)
-- Global risk packages: the built-in conservative list
+- Global risk packages: empty (dependency changes scope to known importers)
 
 `schemaVersion` is optional; when provided, it must match the schema version
 supported by the binary. This makes config/binary mismatches explicit.
@@ -323,9 +323,13 @@ import edges from the exempted file are still resolved normally.
 `unresolvedImportIgnore` quarantines known stale local import specifiers while
 unresolved imports in other files remain fail-closed.
 
-`globalRiskPackages` replaces the built-in high-risk dependency list when set to a
-non-empty array, allowing repositories to tune which dependency changes force a
-full suite. An empty or omitted list keeps the built-in list.
+Dependency changes in `package.json` and supported lockfiles are mapped to the
+files that import the changed packages, then traced to their dependent tests.
+`globalRiskPackages` is an optional opt-in for dependencies whose changes should
+still force a full suite; it is empty by default. Changes under `scripts` in
+`package.json` are ignored because they do not alter the import graph. Other
+package metadata remains fail-closed unless explicitly listed in
+`packageJsonIgnore`.
 
 ## Development
 

@@ -126,54 +126,19 @@ where
     if changed_packages.is_empty() {
         return Ok(Some(Box::default()));
     }
-    if changed_packages.iter().any(|package| {
-        request.config.map_or_else(
-            || is_global_risk_package(package),
-            |config| {
-                config.global_risk_packages().is_empty() && is_global_risk_package(package)
-                    || config
-                        .global_risk_packages()
-                        .iter()
-                        .any(|risk_package| risk_package.as_ref() == package.as_ref())
-            },
-        )
+    if request.config.is_some_and(|config| {
+        changed_packages.iter().any(|package| {
+            config
+                .global_risk_packages()
+                .iter()
+                .any(|risk_package| risk_package.as_ref() == package.as_ref())
+        })
     }) {
         return Ok(None);
     }
 
     let importers = importers_for_packages(request.graph, &changed_packages);
-    if importers.is_empty() {
-        // The dependency changed but no known file imports it at runtime (for
-        // example it is only reachable through a type-only import). Keep the
-        // metadata change so it stays a fail-closed global invalidator rather
-        // than silently selecting nothing.
-        return Ok(None);
-    }
-
     Ok(Some(importers))
-}
-
-fn is_global_risk_package(package: &str) -> bool {
-    matches!(
-        package,
-        "bun"
-            | "next"
-            | "react"
-            | "react-dom"
-            | "typescript"
-            | "tsx"
-            | "prisma"
-            | "@prisma/client"
-            | "@types/node"
-            | "@types/react"
-            | "@types/react-dom"
-            | "jest"
-            | "bun-plugin-tailwind"
-            | "tailwindcss"
-            | "webpack"
-            | "vite"
-            | "eslint"
-    )
 }
 
 fn changed_package_json_packages(
@@ -217,9 +182,10 @@ fn json_values_equal_ignoring(
     path: &str,
     ignored_fields: &[Box<str>],
 ) -> bool {
-    if ignored_fields
-        .iter()
-        .any(|ignored| ignored.as_ref() == path)
+    if path == "scripts"
+        || ignored_fields
+            .iter()
+            .any(|ignored| ignored.as_ref() == path)
     {
         return true;
     }
@@ -400,6 +366,7 @@ mod tests {
     use crate::dependencies;
     use crate::failure;
     use crate::roots;
+    use crate::settings;
     use crate::vcs;
     use crate::vcs::ChangeSetView;
 
@@ -430,6 +397,37 @@ mod tests {
                 .files
                 .get(&(Box::<str>::from(revision), path.clone()))
                 .cloned())
+        }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct FixtureConfig {
+        global_risk_packages: Box<[Box<str>]>,
+    }
+
+    impl settings::View for FixtureConfig {
+        fn source_includes(&self) -> &[settings::Pattern] {
+            &[]
+        }
+
+        fn excludes(&self) -> &[settings::Pattern] {
+            &[]
+        }
+
+        fn test_patterns(&self) -> &[settings::TestFilePattern] {
+            &[]
+        }
+
+        fn global_invalidators(&self) -> &[settings::Pattern] {
+            &[]
+        }
+
+        fn dynamic_imports(&self) -> settings::UnknownDynamicImportBehavior {
+            settings::UnknownDynamicImportBehavior::FailClosed
+        }
+
+        fn global_risk_packages(&self) -> &[Box<str>] {
+            self.global_risk_packages.as_ref()
         }
     }
 
@@ -486,20 +484,20 @@ mod tests {
     }
 
     #[test]
-    fn package_json_ignores_only_configured_nested_script_fields() {
-        let changed = super::changed_package_json_packages(
-            r#"{"name":"app","scripts":{"data:reset:ar":"prisma db push"}}"#,
-            r#"{"name":"app","scripts":{"data:reset:ar":"prisma db push --legacy"}}"#,
-            &[Box::<str>::from("scripts.data:reset:ar")],
+    fn package_json_ignores_scripts_by_default_but_keeps_other_metadata_fail_closed() {
+        let scripts_only = super::changed_package_json_packages(
+            r#"{"name":"app","scripts":{"test":"bun test"}}"#,
+            r#"{"name":"app","scripts":{"test":"bun test --coverage"}}"#,
+            &[],
         );
-        assert_eq!(changed, Some(std::collections::BTreeSet::new()));
+        assert_eq!(scripts_only, Some(std::collections::BTreeSet::new()));
 
-        let unrelated = super::changed_package_json_packages(
-            r#"{"name":"app","scripts":{"test":"bun test","data:reset:ar":"x"}}"#,
-            r#"{"name":"app","scripts":{"test":"bun test --coverage","data:reset:ar":"y"}}"#,
-            &[Box::<str>::from("scripts.data:reset:ar")],
+        let other_metadata = super::changed_package_json_packages(
+            r#"{"name":"app","scripts":{"test":"bun test"},"type":"module"}"#,
+            r#"{"name":"app","scripts":{"test":"bun test --coverage"},"type":"commonjs"}"#,
+            &[],
         );
-        assert_eq!(unrelated, None);
+        assert_eq!(other_metadata, None);
     }
 
     #[test]
@@ -534,7 +532,7 @@ mod tests {
     }
 
     #[test]
-    fn package_json_script_changes_remain_global_invalidators() {
+    fn package_json_script_only_changes_do_not_invalidate_tests() {
         let repository = repository_with_file(
             super::PACKAGE_JSON,
             r#"{"scripts":{"test":"bun test"},"dependencies":{"lodash":"1.0.0"}}"#,
@@ -552,6 +550,71 @@ mod tests {
             changes: &changes,
             graph: &graph,
             config: None::<&crate::settings::ResolvedConfig>,
+        })
+        .unwrap();
+
+        assert_eq!(scoped.files(), []);
+    }
+
+    #[test]
+    fn formerly_high_risk_dependency_changes_scope_to_importers() {
+        let repository = repository_with_file(
+            super::PACKAGE_JSON,
+            r#"{"dependencies":{"react":"18.0.0"}}"#,
+            r#"{"dependencies":{"react":"19.0.0"}}"#,
+        );
+        let graph = FixtureGraph {
+            external_importers: BTreeMap::from([(
+                Box::<str>::from("react"),
+                Box::from([path("src/uses-react.test.ts")]),
+            )]),
+            empty: Box::from([]),
+        };
+        let changes = vcs::ChangeSet {
+            files: Box::from([modified(super::PACKAGE_JSON)]),
+        };
+
+        let scoped = super::scoped_changes(&super::ScopeRequest {
+            repository: &repository,
+            base: "base",
+            head: "head",
+            changes: &changes,
+            graph: &graph,
+            config: None::<&crate::settings::ResolvedConfig>,
+        })
+        .unwrap();
+
+        assert_eq!(scoped.files(), &[modified("src/uses-react.test.ts")]);
+    }
+
+    #[test]
+    fn explicitly_configured_global_risk_packages_still_force_full_selection() {
+        let repository = repository_with_file(
+            super::PACKAGE_JSON,
+            r#"{"dependencies":{"react":"18.0.0"}}"#,
+            r#"{"dependencies":{"react":"19.0.0"}}"#,
+        );
+        let graph = FixtureGraph {
+            external_importers: BTreeMap::from([(
+                Box::<str>::from("react"),
+                Box::from([path("src/uses-react.test.ts")]),
+            )]),
+            empty: Box::from([]),
+        };
+        let changes = vcs::ChangeSet {
+            files: Box::from([modified(super::PACKAGE_JSON)]),
+        };
+        let config = FixtureConfig {
+            global_risk_packages: Box::from([Box::<str>::from("react")]),
+        };
+
+        let scoped = super::scoped_changes(&super::ScopeRequest {
+            repository: &repository,
+            base: "base",
+            head: "head",
+            changes: &changes,
+            graph: &graph,
+            config: Some(&config),
         })
         .unwrap();
 
@@ -590,14 +653,13 @@ mod tests {
     }
 
     #[test]
-    fn dependency_change_with_no_known_importer_stays_fail_closed() {
+    fn dependency_change_with_no_known_importer_selects_no_tests() {
         let repository = repository_with_file(
             super::PACKAGE_JSON,
             r#"{"name":"app","dependencies":{"lodash":"1.0.0"}}"#,
             r#"{"name":"app","dependencies":{"lodash":"2.0.0"}}"#,
         );
-        // The graph records no importer for lodash, modeling a package used only
-        // through a type-only import or under `dynamicImports: ignore`.
+        // No file in the current workspace's source or test graph imports lodash.
         let graph = FixtureGraph::default();
         let changes = vcs::ChangeSet {
             files: Box::from([modified(super::PACKAGE_JSON)]),
@@ -613,41 +675,6 @@ mod tests {
         })
         .unwrap();
 
-        // Desired: scoping to zero known importers must not silently erase the
-        // change; package.json should remain so it can fail closed. Current code
-        // drops it entirely, yielding an empty change set.
-        assert!(
-            scoped
-                .files()
-                .iter()
-                .any(|change| change.path == path(super::PACKAGE_JSON)),
-            "package metadata change must stay fail-closed when it maps to no importers, got {} files",
-            scoped.files().len(),
-        );
-    }
-
-    #[test]
-    fn risk_package_changes_remain_global_invalidators() {
-        let repository = repository_with_file(
-            super::PACKAGE_JSON,
-            r#"{"dependencies":{"react":"18.0.0"}}"#,
-            r#"{"dependencies":{"react":"19.0.0"}}"#,
-        );
-        let graph = FixtureGraph::default();
-        let changes = vcs::ChangeSet {
-            files: Box::from([modified(super::PACKAGE_JSON)]),
-        };
-
-        let scoped = super::scoped_changes(&super::ScopeRequest {
-            repository: &repository,
-            base: "base",
-            head: "head",
-            changes: &changes,
-            graph: &graph,
-            config: None::<&crate::settings::ResolvedConfig>,
-        })
-        .unwrap();
-
-        assert_eq!(scoped.files(), changes.files());
+        assert_eq!(scoped.files(), []);
     }
 }
